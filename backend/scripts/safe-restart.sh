@@ -3,7 +3,7 @@
 # Gate: tests MUST pass before restart happens
 set -e
 
-BACKEND_DIR="/root/.openclaw/workspace/wooverse/app/backend"
+BACKEND_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "🔱 Wooverse Safe Deploy"
 echo ""
