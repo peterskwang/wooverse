@@ -1,13 +1,14 @@
 {
   "name": "flow-app-backend",
   "version": "0.1.0",
-  "description": "FLOW App backend — Node.js + Express + WebSocket",
+  "description": "FLOW App backend \u2014 Node.js + Express + WebSocket",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "migrate": "node migrations/run.js",
-    "test": "jest"
+    "test": "bash tests/run-e2e.sh",
+    "test:e2e": "bash tests/run-e2e.sh"
   },
   "dependencies": {
     "apple-signin-auth": "^1.7.9",
