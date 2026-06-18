@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/db');
-const { disconnectUser } = require('../services/ws');
+const { disconnectUser, broadcastToGroup, broadcastToRoom } = require('../services/ws');
 const { sendSosPush } = require('../services/push_notifications');
 
 // Simple password auth for admin
@@ -52,6 +52,37 @@ router.get('/sos', requireAdmin, async (req, res) => {
     res.json(result.rows);
   } catch (e) {
     console.error('[admin] list sos error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/admin/sos/:id/resolve
+router.patch('/sos/:id/resolve', requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE sos_events
+       SET resolved_at = COALESCE(resolved_at, now()),
+           resolved_by = COALESCE(resolved_by, 'admin')
+       WHERE id = $1
+       RETURNING *`,
+      [req.params.id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'SOS event not found' });
+    }
+    const event = result.rows[0];
+    if (event.group_id) {
+      broadcastToGroup(event.group_id, {
+        type: 'sos_resolved',
+        sos_id: event.id,
+        resolved_by: event.resolved_by,
+        resolved_at: event.resolved_at,
+      });
+    }
+    broadcastToRoom('admin', { type: 'refresh_sos' });
+    res.json(event);
+  } catch (e) {
+    console.error('[admin] resolve sos error:', e.message);
     res.status(500).json({ error: 'Server error' });
   }
 });

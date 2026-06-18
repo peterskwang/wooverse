@@ -7,6 +7,8 @@ const rooms = new Map();
 const userSockets = new Map();
 // Per-user audio sequence numbers
 const speakerSeq = new Map();
+// Floor lock: groupId → userId currently holding the channel (null = free)
+const channelFloor = new Map();
 
 async function ensureUserAllowed(userId) {
   if (!userId) {
@@ -96,6 +98,15 @@ function setupWebSocket(server) {
 
 async function handleMessage(ws, msg) {
   switch (msg.type) {
+    case 'admin_join': {
+      if (!rooms.has('admin')) rooms.set('admin', new Set());
+      const adminRoom = rooms.get('admin');
+      ws.isAdmin = true;
+      adminRoom.add(ws);
+      ws.send(JSON.stringify({ type: 'joined', room: 'admin' }));
+      break;
+    }
+
     case 'join': {
       try {
         const userRecord = await ensureUserAllowed(msg.userId);
@@ -160,6 +171,16 @@ async function handleMessage(ws, msg) {
     }
 
     case 'ptt_start': {
+      const currentHolder = channelFloor.get(msg.groupId) ?? null;
+      if (currentHolder && currentHolder !== msg.userId) {
+        // Channel is taken — reject and notify sender only
+        ws.send(JSON.stringify({
+          type: 'channel_busy',
+          holderId: currentHolder,
+        }));
+        break;
+      }
+      channelFloor.set(msg.groupId, msg.userId);
       broadcastToGroup(msg.groupId, {
         type: 'ptt_start',
         userId: msg.userId,
@@ -169,6 +190,10 @@ async function handleMessage(ws, msg) {
     }
 
     case 'ptt_end': {
+      // Only release the floor if this user actually holds it
+      if (channelFloor.get(msg.groupId) === msg.userId) {
+        channelFloor.delete(msg.groupId);
+      }
       broadcastToGroup(msg.groupId, {
         type: 'ptt_end',
         userId: msg.userId,
@@ -206,15 +231,27 @@ async function handleMessage(ws, msg) {
 }
 
 function handleDisconnect(ws) {
+  if (ws.isAdmin && rooms.has('admin')) {
+    const adminRoom = rooms.get('admin');
+    adminRoom.delete(ws);
+    if (adminRoom.size === 0) rooms.delete('admin');
+  }
+
   if (ws.userId) {
     userSockets.delete(ws.userId);
     speakerSeq.delete(ws.userId);
   }
   if (ws.groupId && rooms.has(ws.groupId)) {
+    // Release floor if this user was holding it
+    if (channelFloor.get(ws.groupId) === ws.userId) {
+      channelFloor.delete(ws.groupId);
+      broadcastToGroup(ws.groupId, { type: 'ptt_end', userId: ws.userId });
+    }
     const room = rooms.get(ws.groupId);
     room.delete(ws);
     if (room.size === 0) {
       rooms.delete(ws.groupId);
+      channelFloor.delete(ws.groupId);
     }
     broadcastToGroup(ws.groupId, {
       type: 'member_left',
@@ -233,6 +270,21 @@ function broadcastToGroup(groupId, msg, exclude = null) {
       client.send(payload);
     }
   }
+
+  if (groupId !== 'admin' && (msg.type === 'sos_alert' || msg.type === 'sos_resolved')) {
+    broadcastToRoom('admin', msg);
+  }
+}
+
+function broadcastToRoom(roomName, msg) {
+  const room = rooms.get(roomName);
+  if (!room) return;
+  const payload = JSON.stringify(msg);
+  for (const client of room) {
+    if (client.readyState === 1) {
+      client.send(payload);
+    }
+  }
 }
 
 function disconnectUser(userId, reason = 'admin_disconnect') {
@@ -247,4 +299,4 @@ function disconnectUser(userId, reason = 'admin_disconnect') {
   userSockets.delete(userId);
 }
 
-module.exports = { setupWebSocket, broadcastToGroup, disconnectUser };
+module.exports = { setupWebSocket, broadcastToGroup, broadcastToRoom, disconnectUser };

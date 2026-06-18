@@ -1,13 +1,23 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import dynamic from 'next/dynamic';
 import Layout from '../components/Layout';
 import { adminApi, AdminSosEvent } from '../api/adminApi';
+import 'leaflet/dist/leaflet.css';
+
+const SosMap = dynamic(() => import('../components/SosMap'), { ssr: false });
+
+type WsStatus = 'connecting' | 'connected' | 'disconnected';
+
+const DEFAULT_CENTER: [number, number] = [25.033, 121.5654];
 
 export default function SosPage() {
   const [events, setEvents] = useState<AdminSosEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [resolvingIds, setResolvingIds] = useState<Set<string>>(new Set());
+  const [wsStatus, setWsStatus] = useState<WsStatus>('connecting');
 
-  const loadEvents = async () => {
+  const loadEvents = useCallback(async () => {
     try {
       setLoading(true);
       setError('');
@@ -18,13 +28,108 @@ export default function SosPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  const handleResolve = useCallback(
+    async (id: string) => {
+      if (resolvingIds.has(id)) return;
+      setResolvingIds((prev) => new Set(prev).add(id));
+      try {
+        await adminApi.resolveSos(id);
+        await loadEvents();
+      } catch (e: any) {
+        setError(e.message || 'Failed to resolve SOS event');
+      } finally {
+        setResolvingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [loadEvents, resolvingIds]
+  );
 
   useEffect(() => {
     loadEvents();
+  }, [loadEvents]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    import('leaflet').then((leafletModule: any) => {
+      if (cancelled) return;
+      const L = leafletModule.default || leafletModule;
+      delete (L.Icon.Default.prototype as any)._getIconUrl;
+      L.Icon.Default.mergeOptions({
+        iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+        iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+        shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const activeCount = events.filter((e) => !e.resolved_at).length;
+  useEffect(() => {
+    let closed = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let socket: WebSocket | null = null;
+
+    const connect = () => {
+      const baseWsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8100';
+      const wsUrl = baseWsUrl.endsWith('/ws') ? baseWsUrl : `${baseWsUrl}/ws`;
+      setWsStatus('connecting');
+      socket = new WebSocket(wsUrl);
+
+      socket.onopen = () => {
+        setWsStatus('connected');
+        socket?.send(JSON.stringify({ type: 'admin_join' }));
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (['sos_alert', 'sos_resolved', 'refresh_sos'].includes(msg.type)) {
+            loadEvents();
+          }
+        } catch {
+          // Ignore malformed WS payloads.
+        }
+      };
+
+      socket.onclose = () => {
+        if (closed) return;
+        setWsStatus('disconnected');
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+
+      socket.onerror = () => {
+        socket?.close();
+      };
+    };
+
+    connect();
+
+    return () => {
+      closed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, [loadEvents]);
+
+  const activeEvents = useMemo(() => events.filter((e) => !e.resolved_at), [events]);
+  const activeMappableEvents = useMemo(
+    () => activeEvents.filter((e) => e.lat != null && e.lng != null),
+    [activeEvents]
+  );
+
+  const mapKey = useMemo(
+    () => activeMappableEvents.map((e) => e.id).join(','),
+    [activeMappableEvents]
+  );
 
   return (
     <Layout>
@@ -32,19 +137,49 @@ export default function SosPage() {
         <h2 className="text-2xl font-bold text-white">
           SOS Events{' '}
           <span className="text-slate-400 text-lg font-normal">({events.length})</span>
-          {activeCount > 0 && (
+          {activeEvents.length > 0 && (
             <span className="ml-3 bg-red-900/60 text-red-400 text-sm font-bold px-3 py-1 rounded-full animate-pulse">
-              {activeCount} ACTIVE
+              {activeEvents.length} ACTIVE
             </span>
           )}
         </h2>
-        <button
-          onClick={loadEvents}
-          className="text-sm bg-[#1e3a5f] hover:bg-[#1e88e5] text-white px-4 py-2 rounded-lg transition-colors"
-        >
-          Refresh
-        </button>
+        <div className="flex items-center gap-3">
+          <span
+            className={`text-xs px-3 py-1 rounded-full font-semibold ${
+              wsStatus === 'connected'
+                ? 'bg-green-900/50 text-green-300'
+                : wsStatus === 'connecting'
+                ? 'bg-yellow-900/50 text-yellow-300'
+                : 'bg-red-900/50 text-red-300'
+            }`}
+          >
+            WS {wsStatus}
+          </span>
+          <button
+            onClick={loadEvents}
+            className="text-sm bg-[#1e3a5f] hover:bg-[#1e88e5] text-white px-4 py-2 rounded-lg transition-colors"
+          >
+            Refresh
+          </button>
+        </div>
       </div>
+
+      <div className="mb-6 rounded-xl border border-[#1e3a5f] bg-[#06121f] p-3">
+        {activeMappableEvents.length === 0 ? (
+          <div className="h-[360px] rounded-lg border border-dashed border-[#1e3a5f] flex items-center justify-center text-slate-400 text-sm">
+            No active SOS coordinates to map.
+          </div>
+        ) : (
+          <SosMap
+            events={activeMappableEvents}
+            resolvingIds={resolvingIds}
+            onResolve={handleResolve}
+            mapKey={mapKey}
+            defaultCenter={DEFAULT_CENTER}
+          />
+        )}
+      </div>
+
       {loading && <p className="text-slate-400">Loading...</p>}
       {error && <p className="text-red-400">{error}</p>}
       {!loading && !error && (
@@ -56,6 +191,7 @@ export default function SosPage() {
                 <th className="px-4 py-3 text-left text-slate-400 font-semibold">Coordinates</th>
                 <th className="px-4 py-3 text-left text-slate-400 font-semibold">Triggered</th>
                 <th className="px-4 py-3 text-left text-slate-400 font-semibold">Status</th>
+                <th className="px-4 py-3 text-left text-slate-400 font-semibold">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -82,6 +218,19 @@ export default function SosPage() {
                       <span className="bg-red-900/50 text-red-400 px-2 py-1 rounded text-xs font-semibold animate-pulse">
                         ACTIVE
                       </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3">
+                    {event.resolved_at ? (
+                      <span className="text-slate-500 text-xs">—</span>
+                    ) : (
+                      <button
+                        onClick={() => handleResolve(event.id)}
+                        disabled={resolvingIds.has(event.id)}
+                        className="bg-green-700 hover:bg-green-600 disabled:bg-slate-500 text-white text-xs px-3 py-1 rounded font-semibold"
+                      >
+                        {resolvingIds.has(event.id) ? 'Resolving...' : 'Resolve'}
+                      </button>
                     )}
                   </td>
                 </tr>
