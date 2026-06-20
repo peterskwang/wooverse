@@ -1,0 +1,96 @@
+# Wooverse — Cursor Rules
+# Ski app: group intercom, live GPS map, SOS alerts. Expo RN + Node.js + Next.js + PostgreSQL.
+
+## Stack
+
+- **Frontend:** Expo (React Native) — iOS + Android
+- **Backend:** Node.js + Express, port 8100
+- **WebSocket:** ws:// on same Express server, route /ws
+- **Admin:** Next.js, port 8101
+- **Database:** PostgreSQL — isolated `wooverse` DB
+- **Auth:** Device-based (no passwords), JWT tokens
+- **Push Notifications:** Expo Push API
+- **BLE:** Wooverse smart goggles audio bridge (native build only, not Expo Go)
+- **Maps:** Gaode Maps (AMap) via `GAODE_API_KEY`
+
+## Project Structure
+
+```
+/opt/wooverse/
+├── backend/          Node.js + Express + WebSocket
+│   ├── src/          source code
+│   ├── tests/        test suite
+│   ├── scripts/      utility scripts
+│   └── migrations/   SQL migration files (001_initial.sql, 002_phase3.sql, 003_push_tokens.sql)
+├── frontend/         Expo React Native app
+│   ├── src/
+│   │   ├── screens/     Registration, Map, Intercom, SOS, iPod, Settings
+│   │   ├── components/  shared UI components
+│   │   ├── services/    API client, WebSocket, BLE
+│   │   └── hooks/       custom hooks
+│   └── app.json
+├── admin/            Next.js admin dashboard
+│   └── src/
+└── docs/             Testing manuals, Argus review notes
+```
+
+## Conventions
+
+### API Patterns
+- Routes: `/api/<resource>` — RESTful, JSON request/response
+- Auth: JWT in `Authorization: Bearer <token>` header
+- Admin routes: require `X-Admin-Password` header
+- Error responses: `{ "error": "message" }` with appropriate HTTP status
+- All new endpoints must include request validation
+
+### Database
+- UUID primary keys for users
+- Timestamps: `created_at`, `updated_at`, `joined_at`, `triggered_at`, `resolved_at`
+- Upsert pattern for locations table (single row per user)
+- Row-level security not used — app-level auth
+- Migration files numbered sequentially; never edit existing migrations, always add new ones
+
+### Frontend
+- Expo Router for navigation
+- Screens: Registration, Map, Intercom, SOS, iPod, Settings
+- Platform-specific code: use `Platform.OS` checks, not separate files
+- Always wrap native-only features (BLE) in Platform.OS guards
+- Expo Go compatible unless BLE required
+
+### General
+- Environment variables: never hardcode. Use `.env` (backend), `.env.local` (admin), `.env` with `EXPO_PUBLIC_` prefix (frontend)
+- Credentials: never in source code. Reference env vars only.
+- Test files: `*.test.ts` or `*.test.js` in `tests/` directories
+- E2E tests: run before every push via pre-push hook (68/68 currently passing)
+
+## Anti-Patterns — NEVER
+
+### Business Logic
+- ❌ Never let Cursor generate complex business logic without explicit spec and human review
+- ❌ Never trust Cursor-generated auth/security code without pipeline validation (vault-woo + argus-woo)
+- ❌ Never let Cursor modify database schema without migration file review
+- ❌ Never let Cursor change WebSocket protocol without testing against existing clients
+
+### Code Quality
+- ❌ Never commit console.log in production code (use proper logging)
+- ❌ Never hardcode URLs or IPs (use env vars)
+- ❌ Never bypass TypeScript strict mode without explicit justification
+- ❌ Never merge PR without pipeline passing (argus-woo approval gate)
+- ❌ Never push directly to main (features branches → PR → merge)
+
+### Safety
+- ❌ Never expose credentials in code, comments, or commit messages
+- ❌ Never disable SSL/TLS or auth checks in production code
+- ❌ Never bypass rate limiting or validation middleware
+- ❌ Never commit `.env` files or credential-bearing configs
+
+## Cursor Workflow
+
+- **Cmd+I (Composer):** Use for features >50 lines. Write a short spec comment first, let Cursor generate, then review every line.
+- **Cmd+K (Inline):** Use for targeted edits — "add input validation", "add error handling to this function"
+- **Cmd+L (Chat):** Use for understanding — "explain this WebSocket handler", "find the race condition in this file"
+- **Tab (Complete):** Accept for boilerplate (imports, type definitions, component props); review for logic
+
+## Pipeline Gate
+
+Every PR → argus-woo reviews (docs, security, compliance) → vault-woo checks (credentials, secrets) → auto-merge if approved. Cursor-generated code is NOT exempt from this pipeline. All code, whether hand-written or Cursor-generated, goes through the same validation gate.
