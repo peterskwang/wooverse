@@ -98,6 +98,15 @@
 - **Cmd+L (Chat):** Use for understanding — "explain this WebSocket handler", "find the race condition in this file"
 - **Tab (Complete):** Accept for boilerplate (imports, type definitions, component props); review for logic
 
+## Memory Rules — Prevent Duplicate Work
+
+Before generating ANY code, Cursor MUST:
+1. **Read `docs/SPEC_REGISTER.md`** — confirms the feature doesn't already exist
+2. **Read `docs/DECISIONS.md`** — respects past architecture choices (no reversing decisions)
+3. **After task completion** — update SPEC_REGISTER.md with what was built
+
+Every PR → argus-woo verifies SPEC_REGISTER.md was updated. If a feature was built and the register wasn't updated → auto-reject.
+
 ## Pipeline Gate
 
 ### Branch-Per-Task Rule
@@ -109,6 +118,10 @@ argus-woo runs `git diff main...HEAD --stat` on every PR. Auto-reject if:
 - Config files changed without justification
 - Existing code deleted without `.deleted.YYYYMMDD` rename
 - More than 5 files changed for a single-feature PR
+- `docs/SPEC_REGISTER.md` not updated for the new feature
+
+### Duplicate Detection Gate
+argus-woo checks: does this PR's feature already exist in SPEC_REGISTER.md? If yes → auto-reject with "duplicate of existing feature."
 
 ### Full Pipeline
-Every PR → architect-woo (design) → backlead-woo (backend) → frontlead-woo (frontend) → vault-woo (secrets) → argus-woo (docs/scope/diff gate) → auto-merge if approved. Cursor-generated code is NOT exempt. All code, whether hand-written or Cursor-generated, goes through the same gates.
+Every PR → architect-woo (design) → backlead-woo (backend) → frontlead-woo (frontend) → vault-woo (secrets) → argus-woo (docs/scope/diff/duplicate gate) → auto-merge if approved. Cursor-generated code is NOT exempt. All code, whether hand-written or Cursor-generated, goes through the same gates.
