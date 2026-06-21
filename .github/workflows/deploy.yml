@@ -1,0 +1,130 @@
+name: Deploy to Ali Cloud ECS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Backend install
+        working-directory: backend
+        run: npm ci
+
+      - name: Backend tests
+        working-directory: backend
+        run: npm test
+
+      - name: Admin install
+        working-directory: admin
+        run: npm ci
+
+      - name: Admin build
+        working-directory: admin
+        run: npm run build
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Package release
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=node_modules \
+            --exclude=backend/node_modules \
+            --exclude=admin/node_modules \
+            -czf wooverse-release.tgz .
+
+      - name: Install Aliyun CLI
+        run: |
+          curl -sSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz -o aliyun.tgz
+          tar -xzf aliyun.tgz
+          sudo mv aliyun /usr/local/bin/aliyun
+          aliyun version
+
+      - name: Configure Aliyun CLI
+        env:
+          ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
+          ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
+          ALIYUN_REGION: ${{ secrets.ALIYUN_REGION }}
+        run: |
+          aliyun configure set \
+            --mode AK \
+            --access-key-id "$ALIYUN_ACCESS_KEY_ID" \
+            --access-key-secret "$ALIYUN_ACCESS_KEY_SECRET" \
+            --region "$ALIYUN_REGION"
+
+      - name: Prepare SSH key for release upload
+        env:
+          ALIYUN_ECS_SSH_PRIVATE_KEY: ${{ secrets.ALIYUN_ECS_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$ALIYUN_ECS_SSH_PRIVATE_KEY" ]; then
+            echo "Missing secret ALIYUN_ECS_SSH_PRIVATE_KEY for SCP upload" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$ALIYUN_ECS_SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Upload release archive to ECS
+        env:
+          ALIYUN_ECS_HOST: ${{ secrets.ALIYUN_ECS_HOST }}
+          ALIYUN_ECS_SSH_USER: ${{ secrets.ALIYUN_ECS_SSH_USER }}
+          ALIYUN_RUNCOMMAND_WORKDIR: ${{ secrets.ALIYUN_RUNCOMMAND_WORKDIR }}
+        run: |
+          if [ -z "$ALIYUN_ECS_HOST" ] || [ -z "$ALIYUN_ECS_SSH_USER" ]; then
+            echo "Missing ALIYUN_ECS_HOST or ALIYUN_ECS_SSH_USER secret for SCP upload" >&2
+            exit 1
+          fi
+
+          ssh -o StrictHostKeyChecking=no "$ALIYUN_ECS_SSH_USER@$ALIYUN_ECS_HOST" \
+            "mkdir -p '$ALIYUN_RUNCOMMAND_WORKDIR/incoming'"
+
+          scp -o StrictHostKeyChecking=no \
+            wooverse-release.tgz \
+            "$ALIYUN_ECS_SSH_USER@$ALIYUN_ECS_HOST:$ALIYUN_RUNCOMMAND_WORKDIR/incoming/wooverse-release-${GITHUB_SHA}.tgz"
+
+      - name: Run remote deploy via ECS RunCommand
+        env:
+          ALIYUN_ECS_INSTANCE_ID: ${{ secrets.ALIYUN_ECS_INSTANCE_ID }}
+          ALIYUN_REGION: ${{ secrets.ALIYUN_REGION }}
+          ALIYUN_RUNCOMMAND_WORKDIR: ${{ secrets.ALIYUN_RUNCOMMAND_WORKDIR }}
+        run: |
+          DEPLOY_TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
+          RELEASE_ARCHIVE="$ALIYUN_RUNCOMMAND_WORKDIR/incoming/wooverse-release-${GITHUB_SHA}.tgz"
+
+          {
+            echo "export ALIYUN_RUNCOMMAND_WORKDIR='$ALIYUN_RUNCOMMAND_WORKDIR'"
+            echo "export RELEASE_ARCHIVE='$RELEASE_ARCHIVE'"
+            echo "export DEPLOY_TIMESTAMP='$DEPLOY_TIMESTAMP'"
+            cat scripts/deploy-ecs.sh
+          } > /tmp/wooverse-runcommand.sh
+
+          COMMAND_BASE64="$(base64 -w0 /tmp/wooverse-runcommand.sh)"
+
+          python3 scripts/deploy-final.py \
+            --instance-id "$ALIYUN_ECS_INSTANCE_ID" \
+            --region "$ALIYUN_REGION" \
+            --workdir "$ALIYUN_RUNCOMMAND_WORKDIR" \
+            --command "$COMMAND_BASE64"
