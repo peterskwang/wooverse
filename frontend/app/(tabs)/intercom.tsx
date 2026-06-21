@@ -422,7 +422,7 @@ const IntercomScreen = () => {
         </Pressable>
         {permissionError ? <Text style={styles.errorText}>{permissionError}</Text> : null}
       </View>
-    </View>)
+    </View>
   );
 };
 
