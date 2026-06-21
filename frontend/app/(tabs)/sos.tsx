@@ -58,22 +58,33 @@ const SosScreen = () => {
       Alert.alert('No GPS', 'Waiting for GPS lock. Try again in a moment.');
       return;
     }
+    // Capture coordinates at confirm time to avoid stale-closure (#28)
+    const latestCoords = coords;
     Alert.alert('Confirm SOS', 'Are you sure you want to send an SOS to your group?', [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Send SOS', style: 'destructive', onPress: sendSos }
+      { text: 'Send SOS', style: 'destructive', onPress: () => sendSos(latestCoords) }
     ]);
-  }, [groupId, coords]);
+  }, [groupId, coords, sendSos]);
 
-  const sendSos = useCallback(async () => {
-    if (sending || !groupId || !coords) return;
+  const sendSos = useCallback(async (latestCoords: { latitude: number; longitude: number }) => {
+    if (sending || !groupId) return;
     try {
       setSending(true);
+      // Send via HTTP with lat/lng (#28)
       await api.post('/api/sos', {
         group_id: groupId,
-        lat: coords.latitude,
-        lng: coords.longitude
+        lat: latestCoords.latitude,
+        lng: latestCoords.longitude
       });
-      wsClient.send({ type: 'sos', ts: Date.now() });
+      // Also broadcast via WebSocket so connected peers get it instantly
+      wsClient.send({
+        type: 'sos',
+        ts: Date.now(),
+        payload: {
+          lat: latestCoords.latitude,
+          lng: latestCoords.longitude
+        }
+      });
       setActive(true);
     } catch (error: any) {
       console.error('SOS failed', error);
@@ -82,7 +93,7 @@ const SosScreen = () => {
     } finally {
       setSending(false);
     }
-  }, [sending, groupId, coords]);
+  }, [sending, groupId]);
 
   const ready = Boolean(groupId && coords);
 

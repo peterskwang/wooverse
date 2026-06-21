@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Animated, FlatList, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
@@ -353,55 +353,59 @@ const IntercomScreen = () => {
 
   return (
     <View style={styles.container}>
-      <View style={styles.infoBanner}>
-        <Text style={styles.infoText}>📱 Voice works phone-to-phone · BLE iPod for testing only</Text>
-      </View>
-      <View style={styles.guideCard}>
-        <Text style={styles.guideTitle}>How to test voice</Text>
-        <Text style={styles.guideStep}><Text style={styles.guideNum}>1. </Text>Both phones open the app and go to <Text style={styles.guideBold}>Settings</Text> — enter the same Group ID and a display name, then tap Save.</Text>
-        <Text style={styles.guideStep}><Text style={styles.guideNum}>2. </Text>Make sure both phones show <Text style={styles.guideConnected}>Connected to group intercom</Text> at the bottom.</Text>
-        <Text style={styles.guideStep}><Text style={styles.guideNum}>3. </Text>On one phone, <Text style={styles.guideBold}>hold the big blue button</Text> to talk. Release to send.</Text>
-        <Text style={styles.guideStep}><Text style={styles.guideNum}>4. </Text>The other phone will play the audio and show the speaker's name under <Text style={styles.guideBold}>Now Talking</Text>.</Text>
-        <Text style={styles.guideStep}><Text style={styles.guideNum}>5. </Text>Swap roles to test both directions. Both phones should appear under <Text style={styles.guideBold}>Group Members</Text>.</Text>
-      </View>
-      <View style={styles.card}>
-        <Text style={styles.heading}>Group Members</Text>
-        <FlatList
-          data={memberList}
-          keyExtractor={(item) => item.id}
-          ListEmptyComponent={<Text style={styles.emptyText}>Waiting for teammates to join...</Text>}
-          renderItem={({ item }) => (
-            <View style={styles.memberRow}>
-              <View style={styles.memberInfo}>
-                <View style={styles.onlineDot} />
-                <Text style={styles.memberName}>{item.name}</Text>
-              </View>
-              {item.isTalking ? (
-                <View style={styles.waveform}>
-                  <View style={styles.waveBar} />
-                  <View style={[styles.waveBar, styles.waveBarTall]} />
-                  <View style={styles.waveBar} />
+      <ScrollView style={styles.scrollArea} contentContainerStyle={styles.scrollContent} bounces={false}>
+        <View style={styles.infoBanner}>
+          <Text style={styles.infoText}>📱 Voice works phone-to-phone · BLE iPod for testing only</Text>
+        </View>
+        <View style={styles.guideCard}>
+          <Text style={styles.guideTitle}>How to test voice</Text>
+          <Text style={styles.guideStep}><Text style={styles.guideNum}>1. </Text>Both phones open the app and go to <Text style={styles.guideBold}>Settings</Text> — enter the same Group ID and a display name, then tap Save.</Text>
+          <Text style={styles.guideStep}><Text style={styles.guideNum}>2. </Text>Make sure both phones show <Text style={styles.guideConnected}>Connected to group intercom</Text> at the bottom.</Text>
+          <Text style={styles.guideStep}><Text style={styles.guideNum}>3. </Text>On one phone, <Text style={styles.guideBold}>hold the big blue button</Text> to talk. Release to send.</Text>
+          <Text style={styles.guideStep}><Text style={styles.guideNum}>4. </Text>The other phone will play the audio and show the speaker's name under <Text style={styles.guideBold}>Now Talking</Text>.</Text>
+          <Text style={styles.guideStep}><Text style={styles.guideNum}>5. </Text>Swap roles to test both directions. Both phones should appear under <Text style={styles.guideBold}>Group Members</Text>.</Text>
+        </View>
+        <View style={styles.card}>
+          <Text style={styles.heading}>Group Members</Text>
+          <FlatList
+            data={memberList}
+            keyExtractor={(item) => item.id}
+            scrollEnabled={false}
+            ListEmptyComponent={<Text style={styles.emptyText}>Waiting for teammates to join...</Text>}
+            renderItem={({ item }) => (
+              <View style={styles.memberRow}>
+                <View style={styles.memberInfo}>
+                  <View style={styles.onlineDot} />
+                  <Text style={styles.memberName}>{item.name}</Text>
                 </View>
-              ) : (
-                <Text style={styles.memberStatus}>Ready</Text>
-              )}
+                {item.isTalking ? (
+                  <View style={styles.waveform}>
+                    <View style={styles.waveBar} />
+                    <View style={[styles.waveBar, styles.waveBarTall]} />
+                    <View style={styles.waveBar} />
+                  </View>
+                ) : (
+                  <Text style={styles.memberStatus}>Ready</Text>
+                )}
+              </View>
+            )}
+          />
+        </View>
+
+        <View style={styles.speakerCard}>
+          <Text style={styles.heading}>Now Talking</Text>
+          {activeSpeaker ? (
+            <View style={styles.speakerRow}>
+              <Animated.View style={[styles.pulseCircle, { transform: [{ scale: pulseScale }] }]} />
+              <Text style={styles.speakerName}>{activeSpeaker.name}</Text>
             </View>
+          ) : (
+            <Text style={styles.emptyText}>Channel is clear</Text>
           )}
-        />
-      </View>
+        </View>
+      </ScrollView>
 
-      <View style={styles.speakerCard}>
-        <Text style={styles.heading}>Now Talking</Text>
-        {activeSpeaker ? (
-          <View style={styles.speakerRow}>
-            <Animated.View style={[styles.pulseCircle, { transform: [{ scale: pulseScale }] }]} />
-            <Text style={styles.speakerName}>{activeSpeaker.name}</Text>
-          </View>
-        ) : (
-          <Text style={styles.emptyText}>Channel is clear</Text>
-        )}
-      </View>
-
+      {/* PTT controls fixed to bottom — never scrolls off-screen (#34) */}
       <View style={styles.controls}>
         <Text style={styles.status}>{statusText}</Text>
         <Pressable
@@ -418,16 +422,22 @@ const IntercomScreen = () => {
         </Pressable>
         {permissionError ? <Text style={styles.errorText}>{permissionError}</Text> : null}
       </View>
-    </View>
+    </View>)
   );
 };
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    backgroundColor: '#06121f'
+  },
+  scrollArea: {
+    flex: 1
+  },
+  scrollContent: {
     padding: 16,
-    backgroundColor: '#06121f',
-    gap: 16
+    gap: 16,
+    paddingBottom: 100 // space for bottom PTT bar
   },
   infoBanner: {
     backgroundColor: '#0d2034',
@@ -471,7 +481,6 @@ const styles = StyleSheet.create({
     fontWeight: '600'
   },
   card: {
-    flex: 1,
     backgroundColor: '#10243b',
     borderRadius: 16,
     padding: 16
@@ -556,7 +565,11 @@ const styles = StyleSheet.create({
   controls: {
     alignItems: 'center',
     gap: 12,
-    paddingBottom: 16
+    paddingVertical: 12,
+    paddingBottom: 16,
+    backgroundColor: '#06121f',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#1e3a5f'
   },
   status: {
     color: '#9fb4cc'
