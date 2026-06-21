@@ -64,7 +64,7 @@ const SosScreen = () => {
       { text: 'Cancel', style: 'cancel' },
       { text: 'Send SOS', style: 'destructive', onPress: () => sendSos(latestCoords) }
     ]);
-  }, [groupId, coords, sendSos]);
+  }, [groupId, coords]);
 
   const sendSos = useCallback(async (latestCoords: { latitude: number; longitude: number }) => {
     if (sending || !groupId) return;
