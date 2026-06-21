@@ -152,7 +152,7 @@ const SettingsScreen = () => {
   const handleLeaveGroup = useCallback(() => {
     Alert.alert(
       'Leave Group',
-      'Are you sure you want to leave your current group?',
+      'You will leave this group but your account stays active. You can join or create a new group anytime.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
