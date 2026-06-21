@@ -38,7 +38,7 @@ router.post('/', requireAuth, async (req, res) => {
       [group_id, req.user.userId]
     );
     const targetIds = memberResult.rows.map((row) => row.user_id);
-    sendSosPush(targetIds, { id: req.user.userId, name: username }, { lat, lng });
+    sendSosPush(targetIds, { id: req.user.userId, name: username }, { lat, lng, group_id });
 
     res.status(201).json({ ...sosEvent, username });
   } catch (e) {
