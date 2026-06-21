@@ -1,0 +1,251 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  GUEST
+  COACH
+  PATROL
+}
+
+enum SosStatus {
+  PENDING
+  ACTIVE
+  RESOLVED
+  CANCELLED
+}
+
+enum WorkOrderStatus {
+  PENDING
+  ACCEPTED
+  ENROUTE
+  ONSITE
+  COMPLETE
+  CANCELLED
+}
+
+enum EvidenceType {
+  VIDEO
+  GPS_TRACK
+  AUDIO
+}
+
+// ─── Core Models ─────────────────────────────────────────────────────────────
+
+model User {
+  id                String    @id @default(uuid())
+  phone             String?   @unique
+  wechatOpenid      String?   @unique @map("wechat_openid")
+  name              String
+  avatarUrl         String?   @map("avatar_url")
+  role              UserRole  @default(GUEST)
+  resortId          String?   @map("resort_id")
+  isCoachCertified  Boolean   @default(false) @map("is_coach_certified")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  resort            Resort?   @relation(fields: [resortId], references: [id])
+  devices           Device[]
+  emergencyContacts EmergencyContact[]
+  sosEvents         SosEvent[]
+  workOrders        WorkOrder[] @relation("AssignedPatrol")
+  channelMemberships ChannelMember[]
+  patrolPositions   PatrolPosition[]
+
+  @@map("users")
+}
+
+model Resort {
+  id          String   @id @default(uuid())
+  name        String
+  logoUrl     String?  @map("logo_url")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  users       User[]
+  channels    Channel[]
+  sosEvents   SosEvent[]
+  workOrders  WorkOrder[]
+
+  @@map("resorts")
+}
+
+// ─── Devices (Flow S Goggles) ─────────────────────────────────────────────────
+
+model Device {
+  id                  String    @id @default(uuid())
+  bleMac              String    @unique @map("ble_mac")
+  ownerUserId         String    @map("owner_user_id")
+  name                String    @default("Flow S")
+  firmwareVersion     String?   @map("firmware_version")
+  batteryPct          Int?      @map("battery_pct")
+  storageRemainingGb  Float?    @map("storage_remaining_gb")
+  wifiConnected       Boolean   @default(false) @map("wifi_connected")
+  lastSeenAt          DateTime? @map("last_seen_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  owner               User      @relation(fields: [ownerUserId], references: [id])
+
+  @@map("devices")
+}
+
+model FirmwareVersion {
+  id            String   @id @default(uuid())
+  version       String   @unique
+  releaseNotes  String?  @map("release_notes")
+  downloadUrl   String   @map("download_url")
+  minBatteryPct Int      @default(40) @map("min_battery_pct")
+  isCurrent     Boolean  @default(false) @map("is_current")
+  releasedAt    DateTime @default(now()) @map("released_at")
+
+  @@map("firmware_versions")
+}
+
+// ─── PTT Channels ─────────────────────────────────────────────────────────────
+
+model Channel {
+  id            String    @id @default(uuid())
+  resortId      String?   @map("resort_id")
+  name          String
+  channelCode   String    @unique @map("channel_code") // 8-digit
+  passwordHash  String?   @map("password_hash")
+  isPublic      Boolean   @default(false) @map("is_public")
+  isEmergency   Boolean   @default(false) @map("is_emergency")
+  maxMembers    Int       @default(20) @map("max_members")
+  creatorId     String    @map("creator_id")
+  dissolvedAt   DateTime? @map("dissolved_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  resort        Resort?   @relation(fields: [resortId], references: [id])
+  members       ChannelMember[]
+
+  @@map("channels")
+}
+
+model ChannelMember {
+  id          String    @id @default(uuid())
+  channelId   String    @map("channel_id")
+  userId      String    @map("user_id")
+  isAdmin     Boolean   @default(false) @map("is_admin")
+  joinedAt    DateTime  @default(now()) @map("joined_at")
+  leftAt      DateTime? @map("left_at")
+
+  channel     Channel   @relation(fields: [channelId], references: [id])
+  user        User      @relation(fields: [userId], references: [id])
+
+  @@unique([channelId, userId])
+  @@map("channel_members")
+}
+
+// ─── SOS ──────────────────────────────────────────────────────────────────────
+
+model SosEvent {
+  id              String    @id @default(uuid())
+  triggerSource   String    @map("trigger_source") // "goggle" | "app"
+  userId          String    @map("user_id")
+  resortId        String?   @map("resort_id")
+  lat             Float
+  lng             Float
+  altitude        Float?
+  status          SosStatus @default(PENDING)
+  offlineQueued   Boolean   @default(false) @map("offline_queued")
+  triggeredAt     DateTime  @map("triggered_at")
+  sentAt          DateTime? @map("sent_at")
+  resolvedAt      DateTime? @map("resolved_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  user            User      @relation(fields: [userId], references: [id])
+  resort          Resort?   @relation(fields: [resortId], references: [id])
+  workOrder       WorkOrder?
+
+  @@map("sos_events")
+}
+
+model EmergencyContact {
+  id            String  @id @default(uuid())
+  ownerUserId   String  @map("owner_user_id")
+  name          String
+  phone         String
+  syncAppPush   Boolean @default(false) @map("sync_app_push")
+  syncResort    Boolean @default(false) @map("sync_resort")
+
+  owner         User    @relation(fields: [ownerUserId], references: [id])
+
+  @@map("emergency_contacts")
+}
+
+// ─── Rescue / Work Orders ─────────────────────────────────────────────────────
+
+model WorkOrder {
+  id                String          @id @default(uuid())
+  sosEventId        String          @unique @map("sos_event_id")
+  resortId          String          @map("resort_id")
+  assignedPatrolId  String?         @map("assigned_patrol_id")
+  status            WorkOrderStatus @default(PENDING)
+  notes             String?
+  blockchainTxHash  String?         @map("blockchain_tx_hash")
+  createdAt         DateTime        @default(now()) @map("created_at")
+  acceptedAt        DateTime?       @map("accepted_at")
+  arrivedAt         DateTime?       @map("arrived_at")
+  completedAt       DateTime?       @map("completed_at")
+
+  sosEvent          SosEvent        @relation(fields: [sosEventId], references: [id])
+  resort            Resort          @relation(fields: [resortId], references: [id])
+  assignedPatrol    User?           @relation("AssignedPatrol", fields: [assignedPatrolId], references: [id])
+  evidence          Evidence[]
+
+  @@map("work_orders")
+}
+
+// ─── Evidence ─────────────────────────────────────────────────────────────────
+
+model Evidence {
+  id                 String       @id @default(uuid())
+  workOrderId        String       @map("work_order_id")
+  type               EvidenceType
+  ossKey             String       @map("oss_key")
+  durationSec        Int?         @map("duration_sec")
+  recordedAt         DateTime?    @map("recorded_at")
+  blockchainTimestamp String?     @map("blockchain_timestamp")
+  retainedUntil      DateTime     @map("retained_until") // 180 days
+  createdAt          DateTime     @default(now()) @map("created_at")
+
+  workOrder          WorkOrder    @relation(fields: [workOrderId], references: [id])
+
+  @@map("evidence")
+}
+
+// ─── Patrol Positions (rolling 24h) ──────────────────────────────────────────
+
+model PatrolPosition {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id")
+  resortId    String   @map("resort_id")
+  lat         Float
+  lng         Float
+  altitude    Float?
+  recordedAt  DateTime @default(now()) @map("recorded_at")
+
+  user        User     @relation(fields: [userId], references: [id])
+
+  @@index([resortId, recordedAt])
+  @@map("patrol_positions")
+}
+
+// ─── Refresh Tokens ───────────────────────────────────────────────────────────
+
+model RefreshToken {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id")
+  token       String   @unique
+  expiresAt   DateTime @map("expires_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@map("refresh_tokens")
+}
