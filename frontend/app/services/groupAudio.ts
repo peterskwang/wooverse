@@ -243,6 +243,33 @@ export class GroupAudioManager {
 
     try {
       if (signal.kind === 'offer') {
+        const isStable = (anyPc.signalingState === 'stable');
+
+        // Perfect Negotiation: if both sides create offers at once (glare),
+        // the lexicographically smaller userId keeps its offer;
+        // the larger yields and accepts the incoming offer.
+        if (!isStable) {
+          if (peer.makingOffer && this.identity.userId > fromUserId) {
+            // We yield — roll back our in-progress offer and accept theirs.
+            peer.makingOffer = false;
+            await anyPc.setRemoteDescription(
+              new RTCSessionDescription({ type: 'offer', sdp: signal.sdp })
+            );
+            peer.remoteDescriptionSet = true;
+            await this.drainIceQueue(peer);
+            const answer = await anyPc.createAnswer();
+            await anyPc.setLocalDescription(answer);
+            const sdp = String(anyPc.localDescription?.sdp || answer?.sdp || '');
+            if (sdp) {
+              this.callbacks.sendSignal(fromUserId, { kind: 'answer', sdp });
+            }
+            return;
+          }
+          // We have initiative or someone else is already in-flight —
+          // politely ignore this offer. The peer will retry if needed.
+          return;
+        }
+
         await anyPc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: signal.sdp }));
         peer.remoteDescriptionSet = true;
         await this.drainIceQueue(peer);

@@ -214,7 +214,10 @@ const IntercomScreen = () => {
     if (message.type === 'member_joined') {
       upsertMemberFromPresence(message, false);
       if (memberId !== userId && manager) {
-        manager.ensurePeer({ userId: memberId, name: message.name }, { createOffer: true }).catch((error) => {
+        // Only create offer if we're lexicographically smaller —
+        // the smaller userId takes initiative to avoid glare.
+        const createOffer = userId < memberId;
+        manager.ensurePeer({ userId: memberId, name: message.name }, { createOffer }).catch((error) => {
           console.warn('[intercom] ensurePeer on join failed:', error);
         });
       }
