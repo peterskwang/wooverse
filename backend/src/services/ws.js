@@ -5,6 +5,8 @@ const { pool } = require('../config/db');
 const rooms = new Map();
 // User → ws mapping
 const userSockets = new Map();
+// User → ISO timestamp of last observed WS presence
+const lastSeenByUser = new Map();
 // Per-user audio sequence numbers
 const speakerSeq = new Map();
 // Goggle simulator registries (ephemeral — in-memory only)
@@ -36,6 +38,74 @@ async function ensureUserAllowed(userId) {
     throw err;
   }
   return record;
+}
+
+async function ensureGroupMembership(userId, groupId) {
+  if (!groupId) {
+    const err = new Error('missing_group');
+    err.code = 'missing_group';
+    throw err;
+  }
+
+  const result = await pool.query(
+    'SELECT 1 FROM group_members WHERE user_id = $1 AND group_id = $2',
+    [userId, groupId]
+  );
+  if (result.rowCount === 0) {
+    const err = new Error('not_group_member');
+    err.code = 'not_group_member';
+    throw err;
+  }
+}
+
+function isOpenSocket(socket) {
+  return socket?.readyState === 1;
+}
+
+function getRoomSocket(groupId, userId) {
+  const room = rooms.get(groupId);
+  if (!room) return null;
+  for (const client of room) {
+    if (client.userId === userId && isOpenSocket(client)) {
+      return client;
+    }
+  }
+  return null;
+}
+
+function getUserPresence(userId, groupId) {
+  const socket = groupId ? getRoomSocket(groupId, userId) : userSockets.get(userId);
+  const online = isOpenSocket(socket);
+  return {
+    online,
+    last_seen_at: online ? socket.lastSeenAt : (lastSeenByUser.get(userId) || null),
+  };
+}
+
+async function getGroupMemberPresence(groupId) {
+  const result = await pool.query(
+    `SELECT gm.user_id, u.name, l.lat, l.lng, l.updated_at AS location_updated_at
+     FROM group_members gm
+     JOIN users u ON u.id = gm.user_id
+     LEFT JOIN locations l ON l.user_id = gm.user_id AND l.group_id = gm.group_id
+     WHERE gm.group_id = $1
+     ORDER BY u.name ASC`,
+    [groupId]
+  );
+
+  return result.rows.map((member) => {
+    const presence = getUserPresence(member.user_id, groupId);
+    return {
+      user_id: member.user_id,
+      userId: member.user_id,
+      name: member.name,
+      online: presence.online,
+      last_seen_at: presence.last_seen_at,
+      lat: member.lat,
+      lng: member.lng,
+      location_updated_at: member.location_updated_at,
+    };
+  });
 }
 
 function startHeartbeat(ws) {
@@ -104,6 +174,11 @@ function setupWebSocket(server) {
 }
 
 async function handleMessage(ws, msg) {
+  if (ws.userId) {
+    ws.lastSeenAt = new Date().toISOString();
+    lastSeenByUser.set(ws.userId, ws.lastSeenAt);
+  }
+
   switch (msg.type) {
     case 'admin_join': {
       if (!msg.adminPassword || msg.adminPassword !== process.env.ADMIN_PASSWORD) {
@@ -121,6 +196,7 @@ async function handleMessage(ws, msg) {
     case 'join': {
       try {
         const userRecord = await ensureUserAllowed(msg.userId);
+        await ensureGroupMembership(msg.userId, msg.groupId);
         if (!rooms.has(msg.groupId)) rooms.set(msg.groupId, new Set());
         const room = rooms.get(msg.groupId);
         if (room.size >= 20) {
@@ -132,21 +208,36 @@ async function handleMessage(ws, msg) {
         ws.userId = msg.userId;
         ws.groupId = msg.groupId;
         ws.name = msg.name || userRecord.name;
+        ws.lastSeenAt = new Date().toISOString();
+        lastSeenByUser.set(msg.userId, ws.lastSeenAt);
         userSockets.set(msg.userId, ws);
         room.add(ws);
         speakerSeq.set(msg.userId, 0);
 
+        ws.send(JSON.stringify({ type: 'joined', groupId: msg.groupId }));
+        ws.send(JSON.stringify({
+          type: 'members_snapshot',
+          groupId: msg.groupId,
+          members: await getGroupMemberPresence(msg.groupId),
+        }));
+
         broadcastToGroup(msg.groupId, {
           type: 'member_joined',
           userId: msg.userId,
+          user_id: msg.userId,
           name: ws.name,
+          online: true,
+          last_seen_at: ws.lastSeenAt,
         }, ws);
-
-        ws.send(JSON.stringify({ type: 'joined', groupId: msg.groupId }));
       } catch (err) {
         if (err.code === 'user_banned') {
           ws.send(JSON.stringify({ type: 'error', message: 'Account banned' }));
           ws.close(4001, 'banned');
+          return;
+        }
+        if (err.code === 'not_group_member') {
+          ws.send(JSON.stringify({ type: 'error', message: 'Not a group member' }));
+          ws.close(1008, 'not_group_member');
           return;
         }
         ws.send(JSON.stringify({ type: 'error', message: 'Unable to join room' }));
@@ -156,28 +247,92 @@ async function handleMessage(ws, msg) {
     }
 
     case 'location': {
-      broadcastToGroup(msg.groupId, {
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      const lat = Number(msg.lat);
+      const lng = Number(msg.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        ws.send(JSON.stringify({ type: 'error', message: 'invalid location' }));
+        return;
+      }
+      const altitudeM = msg.altitude_m == null ? null : Number(msg.altitude_m);
+      const speedMs = msg.speed_ms == null ? null : Number(msg.speed_ms);
+      const locationTs = Date.now();
+      ws.lastSeenAt = new Date().toISOString();
+      lastSeenByUser.set(ws.userId, ws.lastSeenAt);
+
+      broadcastToGroup(ws.groupId, {
         type: 'location',
-        userId: msg.userId,
-        lat: msg.lat,
-        lng: msg.lng,
-        ts: Date.now(),
+        userId: ws.userId,
+        user_id: ws.userId,
+        lat,
+        lng,
+        altitude_m: Number.isFinite(altitudeM) ? altitudeM : null,
+        speed_ms: Number.isFinite(speedMs) ? speedMs : null,
+        sent_at: msg.sent_at || msg.ts || null,
+        ts: locationTs,
       }, ws);
 
       try {
         await pool.query(
-          `INSERT INTO locations (user_id, group_id, lat, lng, updated_at)
-           VALUES ($1, $2, $3, $4, now())
+          `INSERT INTO locations (user_id, group_id, lat, lng, altitude_m, speed_kmh, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, now())
            ON CONFLICT (user_id) DO UPDATE
            SET group_id = excluded.group_id,
                lat = excluded.lat,
                lng = excluded.lng,
+               altitude_m = excluded.altitude_m,
+               speed_kmh = excluded.speed_kmh,
                updated_at = now()`,
-          [msg.userId, msg.groupId, msg.lat, msg.lng]
+          [
+            ws.userId,
+            ws.groupId,
+            lat,
+            lng,
+            Number.isFinite(altitudeM) ? altitudeM : null,
+            Number.isFinite(speedMs) ? speedMs * 3.6 : null,
+          ]
         );
       } catch (err) {
         console.error('[WS] Location persistence failed:', err.message);
       }
+      break;
+    }
+
+    case 'webrtc_signal': {
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      if (!msg.target_user_id) {
+        ws.send(JSON.stringify({ type: 'error', message: 'target_user_id required' }));
+        return;
+      }
+      const targetSocket = getRoomSocket(ws.groupId, msg.target_user_id);
+      if (!targetSocket) {
+        ws.send(JSON.stringify({
+          type: 'webrtc_signal_failed',
+          target_user_id: msg.target_user_id,
+          reason: 'target_offline',
+        }));
+        return;
+      }
+      targetSocket.send(JSON.stringify({
+        type: 'webrtc_signal',
+        from_user_id: ws.userId,
+        signal: msg.signal,
+      }));
+      break;
+    }
+
+    case 'client_ping': {
+      ws.send(JSON.stringify({
+        type: 'server_pong',
+        ts: msg.ts,
+        server_ts: Date.now(),
+      }));
       break;
     }
 
@@ -371,7 +526,11 @@ function handleDisconnect(ws) {
     }
   }
   if (ws.userId) {
-    userSockets.delete(ws.userId);
+    ws.lastSeenAt = new Date().toISOString();
+    lastSeenByUser.set(ws.userId, ws.lastSeenAt);
+    if (userSockets.get(ws.userId) === ws) {
+      userSockets.delete(ws.userId);
+    }
     speakerSeq.delete(ws.userId);
     // Release channel floor if this user held it
     if (ws.groupId && channelFloor.get(ws.groupId) === ws.userId) {
@@ -391,7 +550,10 @@ function handleDisconnect(ws) {
     broadcastToGroup(ws.groupId, {
       type: 'member_left',
       userId: ws.userId,
+      user_id: ws.userId,
       name: ws.name,
+      online: false,
+      last_seen_at: ws.lastSeenAt,
     });
   }
   // Clean up goggle/central registries
@@ -420,7 +582,7 @@ function broadcastToRoom(roomName, msg, exclude = null) {
   if (!room) return;
   const payload = JSON.stringify(msg);
   for (const client of room) {
-    if (client !== exclude && client.readyState === 1) {
+    if (client !== exclude && isOpenSocket(client)) {
       client.send(payload);
     }
   }
@@ -438,4 +600,10 @@ function disconnectUser(userId, reason = 'admin_disconnect') {
   userSockets.delete(userId);
 }
 
-module.exports = { setupWebSocket, broadcastToGroup, broadcastToRoom, disconnectUser };
+module.exports = {
+  setupWebSocket,
+  broadcastToGroup,
+  broadcastToRoom,
+  disconnectUser,
+  getGroupMemberPresence,
+};

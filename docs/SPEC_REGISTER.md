@@ -18,6 +18,7 @@
 - **Live GPS Map:** MapScreen.tsx → Gaode Maps via GAODE_API_KEY
 - **Location Sharing:** WebSocket "location_update" → broadcast to group
 - **Location Storage:** Upsert pattern — single row per user in locations table
+- **Phase 2 PR A — WS contracts + live GPS:** Issue #3 Core Features. backend/src/services/ws.js sends members_snapshot on join with online/last_seen_at, relays authenticated same-room webrtc_signal, supports client_ping/server_pong, and preserves existing PTT, audio_chunk, SOS, goggle, heartbeat, and broadcastToRoom behavior. backend/src/routes/groups.js adds GET /api/groups/:groupId/members REST fallback with requireAuth and online/location data. frontend/app/services/ws.ts adds typed onLocation, onPresence, onMemberSnapshot handlers plus sendWebRtcSignal and sendPing helpers. frontend/app/(tabs)/map.tsx consumes live WS locations for instant teammate pin updates while keeping REST polling fallback. frontend/app/services/location.ts includes altitude/speed in location sends with throttling.
 - **Privacy:** GPS stops when app backgrounded
 - Built: 2026-03
 

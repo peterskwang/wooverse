@@ -2,6 +2,48 @@ type Listener = (payload: any) => void;
 
 type ListenerMap = Record<string, Set<Listener>>;
 
+export interface LocationMessage {
+  type: 'location';
+  userId?: string;
+  user_id?: string;
+  lat: number;
+  lng: number;
+  altitude_m?: number | null;
+  speed_ms?: number | null;
+  sent_at?: number | string | null;
+  ts?: number;
+}
+
+export interface PresenceMessage {
+  type: 'member_joined' | 'member_left';
+  userId?: string;
+  user_id?: string;
+  name?: string;
+  online: boolean;
+  last_seen_at?: string | null;
+}
+
+export interface MemberSnapshotMessage {
+  type: 'members_snapshot';
+  groupId: string;
+  members: Array<{
+    user_id?: string;
+    userId?: string;
+    name?: string;
+    online: boolean;
+    last_seen_at?: string | null;
+    lat?: number | null;
+    lng?: number | null;
+    location_updated_at?: string | null;
+  }>;
+}
+
+export interface WebRtcSignalMessage {
+  type: 'webrtc_signal';
+  from_user_id: string;
+  signal: any;
+}
+
 const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:8100';
 const WS_URL = API_URL.replace('http', 'ws');
 
@@ -55,6 +97,9 @@ class FlowWebSocket {
       try {
         const data = JSON.parse(event.data);
         this.emit('message', data);
+        if (typeof data?.type === 'string') {
+          this.emit(data.type, data);
+        }
       } catch (error) {
         console.warn('Failed to parse WS message', error);
       }
@@ -150,11 +195,54 @@ class FlowWebSocket {
     return () => this.off('message', listener);
   }
 
-  on(event: string, listener: Listener) {
+  onLocation(handler: (msg: LocationMessage) => void): () => void {
+    const listener = (data: any) => {
+      if (data?.type === 'location') {
+        handler(data as LocationMessage);
+      }
+    };
+    this.on('message', listener);
+    return () => this.off('message', listener);
+  }
+
+  onPresence(handler: (msg: PresenceMessage) => void): () => void {
+    const listener = (data: any) => {
+      if (data?.type === 'member_joined' || data?.type === 'member_left') {
+        handler(data as PresenceMessage);
+      }
+    };
+    this.on('message', listener);
+    return () => this.off('message', listener);
+  }
+
+  onMemberSnapshot(handler: (msg: MemberSnapshotMessage) => void): () => void {
+    const listener = (data: any) => {
+      if (data?.type === 'members_snapshot') {
+        handler(data as MemberSnapshotMessage);
+      }
+    };
+    this.on('message', listener);
+    return () => this.off('message', listener);
+  }
+
+  sendWebRtcSignal(targetUserId: string, signal: any) {
+    this.send({
+      type: 'webrtc_signal',
+      target_user_id: targetUserId,
+      signal,
+    });
+  }
+
+  sendPing(ts = Date.now()) {
+    this.send({ type: 'client_ping', ts });
+  }
+
+  on(event: string, listener: Listener): () => void {
     if (!this.listeners[event]) {
       this.listeners[event] = new Set();
     }
     this.listeners[event].add(listener);
+    return () => this.off(event, listener);
   }
 
   off(event: string, listener: Listener) {
