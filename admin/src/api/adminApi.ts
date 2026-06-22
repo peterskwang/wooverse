@@ -1,12 +1,16 @@
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8100';
 
-function getPassword(): string {
+export function getAdminPassword(): string {
   if (typeof window === 'undefined') return '';
   return sessionStorage.getItem('admin_password') || '';
 }
 
+export function getBackendUrl(): string {
+  return BACKEND_URL;
+}
+
 async function adminFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const password = getPassword();
+  const password = getAdminPassword();
   const response = await fetch(`${BACKEND_URL}${path}`, {
     ...options,
     headers: {
@@ -62,6 +66,8 @@ export const adminApi = {
   getUsers: () => adminFetch<AdminUser[]>('/api/admin/users'),
   getGroups: () => adminFetch<AdminGroup[]>('/api/admin/groups'),
   getSosEvents: () => adminFetch<AdminSosEvent[]>('/api/admin/sos'),
+  resolveSos: (id: string) =>
+    adminFetch<AdminSosEvent & { resolved_by_admin: boolean }>(`/api/admin/sos/${id}/resolve`, { method: 'PATCH' }),
   banUser: (id: string) =>
     adminFetch<{ ok: boolean; banned_at: string }>(`/api/admin/users/${id}/ban`, { method: 'POST' }),
   deleteGroup: (id: string) =>
