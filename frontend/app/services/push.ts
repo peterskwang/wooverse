@@ -1,7 +1,9 @@
 import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
+import { USE_JPUSH } from '../config/api';
 import api from './api';
+import { registerPushToken } from './push-jpush';
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -13,6 +15,14 @@ Notifications.setNotificationHandler({
 
 export async function registerForPushNotifications(): Promise<void> {
   try {
+    if (USE_JPUSH) {
+      const jpushRegistered = await registerPushToken();
+      if (jpushRegistered) {
+        console.log('[push] Registered with JPush provider');
+        return;
+      }
+    }
+
     const { status: existingStatus } = await Notifications.getPermissionsAsync();
     let finalStatus = existingStatus;
 
@@ -40,6 +50,7 @@ export async function registerForPushNotifications(): Promise<void> {
     const token = tokenData.data;
 
     await api.post('/api/auth/push-token', {
+      provider: 'expo',
       token,
       platform: Platform.OS,
     });

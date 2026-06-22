@@ -148,6 +148,23 @@ const LoginScreen = () => {
         )}
       </Pressable>
 
+      <View style={styles.altAuthRow}>
+        <Pressable
+          onPress={() => router.push('/auth/wechat-login')}
+          style={({ pressed }) => [styles.altAuthButton, pressed && styles.buttonPressed]}
+          disabled={loading || appleLoading}
+        >
+          <Text style={styles.altAuthButtonText}>WeChat Login</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => router.push('/auth/sms-login')}
+          style={({ pressed }) => [styles.altAuthButton, pressed && styles.buttonPressed]}
+          disabled={loading || appleLoading}
+        >
+          <Text style={styles.altAuthButtonText}>SMS Login</Text>
+        </Pressable>
+      </View>
+
       {Platform.OS === 'ios' && (
         <AppleAuthentication.AppleAuthenticationButton
           buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
@@ -220,6 +237,24 @@ const styles = StyleSheet.create({
   buttonText: {
     color: '#fff',
     fontSize: 18,
+    fontWeight: '700'
+  },
+  altAuthRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 12
+  },
+  altAuthButton: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#1e88e5',
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: 'center'
+  },
+  altAuthButtonText: {
+    color: '#8ec2ff',
+    fontSize: 14,
     fontWeight: '700'
   },
   appleButton: {
