@@ -1,8 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/db');
-const { disconnectUser } = require('../services/ws');
+const { broadcastToGroup, broadcastToRoom, disconnectUser } = require('../services/ws');
 const { sendSosPush } = require('../services/push_notifications');
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // Simple password auth for admin
 function requireAdmin(req, res, next) {
@@ -52,6 +54,44 @@ router.get('/sos', requireAdmin, async (req, res) => {
     res.json(result.rows);
   } catch (e) {
     console.error('[admin] list sos error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/admin/sos/:id/resolve
+router.patch('/sos/:id/resolve', requireAdmin, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    return res.status(400).json({ error: 'invalid id' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE sos_events
+       SET resolved_at = COALESCE(resolved_at, now()),
+           resolved_by = CASE WHEN resolved_at IS NULL THEN NULL ELSE resolved_by END
+       WHERE id = $1
+       RETURNING *`,
+      [req.params.id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'SOS event not found' });
+    }
+
+    const event = result.rows[0];
+    if (event.group_id) {
+      broadcastToGroup(event.group_id, {
+        type: 'sos_resolved',
+        sos_id: event.id,
+        group_id: event.group_id,
+        resolved_by: 'admin',
+        resolved_at: event.resolved_at,
+      });
+    }
+    broadcastToRoom('admin', { type: 'refresh_sos' });
+
+    res.json({ ...event, resolved_by_admin: true });
+  } catch (e) {
+    console.error('[admin] resolve sos error:', e.message);
     res.status(500).json({ error: 'Server error' });
   }
 });

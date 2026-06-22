@@ -105,6 +105,19 @@ function setupWebSocket(server) {
 
 async function handleMessage(ws, msg) {
   switch (msg.type) {
+    case 'admin_join': {
+      if (!msg.adminPassword || msg.adminPassword !== process.env.ADMIN_PASSWORD) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized' }));
+        ws.close(4001, 'unauthorized');
+        return;
+      }
+      if (!rooms.has('admin')) rooms.set('admin', new Set());
+      rooms.get('admin').add(ws);
+      ws.adminRoom = true;
+      ws.send(JSON.stringify({ type: 'joined', room: 'admin' }));
+      break;
+    }
+
     case 'join': {
       try {
         const userRecord = await ensureUserAllowed(msg.userId);
@@ -350,6 +363,13 @@ async function handleMessage(ws, msg) {
 }
 
 function handleDisconnect(ws) {
+  if (ws.adminRoom && rooms.has('admin')) {
+    const room = rooms.get('admin');
+    room.delete(ws);
+    if (room.size === 0) {
+      rooms.delete('admin');
+    }
+  }
   if (ws.userId) {
     userSockets.delete(ws.userId);
     speakerSeq.delete(ws.userId);
@@ -392,7 +412,11 @@ function handleDisconnect(ws) {
 }
 
 function broadcastToGroup(groupId, msg, exclude = null) {
-  const room = rooms.get(groupId);
+  broadcastToRoom(groupId, msg, exclude);
+}
+
+function broadcastToRoom(roomName, msg, exclude = null) {
+  const room = rooms.get(roomName);
   if (!room) return;
   const payload = JSON.stringify(msg);
   for (const client of room) {
@@ -414,4 +438,4 @@ function disconnectUser(userId, reason = 'admin_disconnect') {
   userSockets.delete(userId);
 }
 
-module.exports = { setupWebSocket, broadcastToGroup, disconnectUser };
+module.exports = { setupWebSocket, broadcastToGroup, broadcastToRoom, disconnectUser };

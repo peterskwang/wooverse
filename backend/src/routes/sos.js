@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/auth');
 const { pool } = require('../config/db');
-const { broadcastToGroup } = require('../services/ws');
+const { broadcastToGroup, broadcastToRoom } = require('../services/ws');
 const { sendSosPush } = require('../services/push_notifications');
 
 // Trigger SOS
@@ -27,11 +27,23 @@ router.post('/', requireAuth, async (req, res) => {
       type: 'sos_alert',
       user_id: req.user.userId,
       username,
+      group_id,
       lat,
       lng,
       triggered_at: sosEvent.triggered_at,
       sos_id: sosEvent.id,
     });
+    broadcastToRoom('admin', {
+      type: 'sos_alert',
+      sos_id: sosEvent.id,
+      user_id: req.user.userId,
+      username,
+      group_id,
+      lat,
+      lng,
+      triggered_at: sosEvent.triggered_at,
+    });
+    broadcastToRoom('admin', { type: 'refresh_sos' });
 
     const memberResult = await pool.query(
       'SELECT user_id FROM group_members WHERE group_id = $1 AND user_id <> $2',
