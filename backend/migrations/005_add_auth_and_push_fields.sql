@@ -23,5 +23,9 @@ CREATE TABLE IF NOT EXISTS sms_login_codes (
 
 ALTER TABLE push_tokens
   ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'expo',
+  ADD COLUMN IF NOT EXISTS app_version TEXT,
   ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
+
+UPDATE push_tokens SET provider = 'expo' WHERE provider IS NULL;
+ALTER TABLE push_tokens ALTER COLUMN provider SET NOT NULL;

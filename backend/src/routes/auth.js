@@ -115,11 +115,19 @@ async function createIdentityUser({ name, deviceId, provider, subject }) {
 }
 
 async function upsertAuthIdentity({ userId, provider, subject, metadata }) {
+  // Guard: if the identity is already linked to a DIFFERENT user, reject — no account takeover
+  const existing = await pool.query(
+    `SELECT user_id FROM auth_identities WHERE provider = $1 AND subject = $2`,
+    [provider, subject]
+  );
+  if (existing.rows.length > 0 && existing.rows[0].user_id !== userId) {
+    throw Object.assign(new Error('Identity already linked to a different account'), { statusCode: 409 });
+  }
+
   await pool.query(
     `INSERT INTO auth_identities (user_id, provider, subject, metadata, last_login_at)
      VALUES ($1, $2, $3, $4, now())
      ON CONFLICT (provider, subject) DO UPDATE SET
-       user_id = EXCLUDED.user_id,
        metadata = COALESCE(auth_identities.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb),
        last_login_at = now()`,
     [userId, provider, subject, metadata || {}]

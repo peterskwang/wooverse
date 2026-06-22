@@ -48,9 +48,14 @@ ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
 echo "[deploy] backend npm ci/build/migrate"
 cd "$CURRENT_LINK/backend"
-npm ci
-npm run build --if-present
-npm run migrate
+npm ci --legacy-peer-deps
+npm run build
+if [ -d migrations ] && ls migrations/*.sql >/dev/null 2>&1; then
+  for f in migrations/*.sql; do
+    echo "[deploy] applying migration: $f"
+    PGPASSWORD="${DB_PASSWORD}" psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -f "$f"
+  done
+fi
 
 echo "[deploy] admin npm ci/build"
 cd "$CURRENT_LINK/admin"
