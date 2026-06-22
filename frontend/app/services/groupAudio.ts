@@ -379,7 +379,7 @@ export class GroupAudioManager {
       if (!stream) return;
       record.remoteStream = stream;
       this.callbacks.onRemoteStream?.(peer.userId, stream);
-      stream.getAudioTracks().forEach((track) => {
+      stream.getAudioTracks().forEach((track: MediaStreamTrack) => {
         this.callbacks.onSpeakingTrack?.(peer.userId, !!track.enabled);
       });
     };
