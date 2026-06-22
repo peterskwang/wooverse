@@ -31,6 +31,9 @@ class FlowWebSocket {
       this.socket = null;
     }
 
+    // Reset for the new socket — reconnect on genuine network drops
+    this.manuallyDisconnected = false;
+
     this.identity = { userId, groupId, name };
     this._openSocket();
   }

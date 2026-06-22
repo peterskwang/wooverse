@@ -27,6 +27,7 @@ const IntercomScreen = () => {
   const [activeSpeaker, setActiveSpeaker] = useState<MemberState | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error' | 'closed'>(wsClient.getState());
   const [isRecording, setIsRecording] = useState(false);
+  const [channelBusy, setChannelBusy] = useState(false);
   const [permissionError, setPermissionError] = useState<string | null>(null);
 
   const recordingRef = useRef<Audio.Recording | null>(null);
@@ -171,13 +172,19 @@ const IntercomScreen = () => {
           };
         });
         setActiveSpeaker((current) => (current && current.id === senderId ? null : current));
+        setChannelBusy(false);
         break;
       case 'ptt_busy':
         // Another user holds the channel floor — stop local recording
         setIsRecording(false);
+        setChannelBusy(true);
+        setTimeout(() => setChannelBusy(false), 3000);
         if (recordingRef.current) {
           recordingRef.current.stopAndUnloadAsync().catch(() => null);
           recordingRef.current = null;
+        }
+        if (activeSpeaker?.id === userId) {
+          setActiveSpeaker(null);
         }
         break;
       case 'audio_chunk':
@@ -408,7 +415,11 @@ const IntercomScreen = () => {
 
       {/* PTT controls fixed to bottom — never scrolls off-screen (#34) */}
       <View style={styles.controls}>
-        <Text style={styles.status}>{statusText}</Text>
+        {channelBusy ? (
+          <Text style={styles.busyText}>Channel busy — someone else is talking</Text>
+        ) : (
+          <Text style={styles.status}>{statusText}</Text>
+        )}
         <Pressable
           onPressIn={startRecording}
           onPressOut={stopRecording}
@@ -545,6 +556,12 @@ const styles = StyleSheet.create({
   },
   status: {
     color: '#9fb4cc'
+  },
+  busyText: {
+    color: '#ff9800',
+    fontWeight: '600',
+    fontSize: 14,
+    textAlign: 'center'
   },
   pttButton: {
     width: 180,
