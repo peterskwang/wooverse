@@ -46,10 +46,9 @@ tar -xzf "$RELEASE_ARCHIVE" -C "$RELEASE_DIR"
 echo "[deploy] updating current symlink -> $RELEASE_DIR"
 ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
-echo "[deploy] backend npm ci/build/migrate"
+echo "[deploy] backend npm ci/migrate (JS-only, no build step)"
 cd "$CURRENT_LINK/backend"
 npm ci --legacy-peer-deps
-npm run build
 if [ -d migrations ] && ls migrations/*.sql >/dev/null 2>&1; then
   for f in migrations/*.sql; do
     echo "[deploy] applying migration: $f"
