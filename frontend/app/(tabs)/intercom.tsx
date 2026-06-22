@@ -1,11 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Animated, FlatList, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as FileSystem from 'expo-file-system/legacy';
-import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
 
-import wsClient from '../services/ws';
-import bleBridge from '../services/ble';
+import wsClient, { MemberSnapshotMessage, PresenceMessage, WebRtcSignalMessage } from '../services/ws';
+import { GroupAudioManager } from '../services/groupAudio';
 
 interface Identity {
   userId: string;
@@ -26,15 +24,291 @@ const IntercomScreen = () => {
   const [members, setMembers] = useState<Record<string, MemberState>>({});
   const [activeSpeaker, setActiveSpeaker] = useState<MemberState | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error' | 'closed'>(wsClient.getState());
-  const [isRecording, setIsRecording] = useState(false);
+  const [isTransmitting, setIsTransmitting] = useState(false);
   const [channelBusy, setChannelBusy] = useState(false);
   const [permissionError, setPermissionError] = useState<string | null>(null);
 
-  const recordingRef = useRef<Audio.Recording | null>(null);
-  const playbackQueue = useRef(Promise.resolve());
+  const groupAudioRef = useRef<GroupAudioManager | null>(null);
+  const pendingPttRef = useRef(false);
+  const recoveryOfferTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const pulseScale = useRef(new Animated.Value(1)).current;
 
   const { userId, groupId, name: displayName } = identity;
+
+  const clearRecoveryTimer = useCallback((peerUserId: string) => {
+    const timer = recoveryOfferTimersRef.current[peerUserId];
+    if (timer) {
+      clearTimeout(timer);
+      delete recoveryOfferTimersRef.current[peerUserId];
+    }
+  }, []);
+
+  const memberIdFromMessage = useCallback((message: any): string | null => {
+    const candidate = message?.userId ?? message?.user_id ?? message?.from_user_id;
+    return typeof candidate === 'string' && candidate.length > 0 ? candidate : null;
+  }, []);
+
+  const upsertMemberFromPresence = useCallback((message: any, isTalking?: boolean) => {
+    const memberId = memberIdFromMessage(message);
+    if (!memberId) return;
+
+    setMembers((prev) => ({
+      ...prev,
+      [memberId]: {
+        id: memberId,
+        name:
+          message?.name ||
+          prev[memberId]?.name ||
+          (memberId === userId ? displayName || 'You' : 'Teammate'),
+        isTalking: isTalking ?? prev[memberId]?.isTalking ?? false,
+      },
+    }));
+  }, [displayName, memberIdFromMessage, userId]);
+
+  const initializeGroupAudio = useCallback(async (currentIdentity: Identity): Promise<void> => {
+    if (groupAudioRef.current) return;
+
+    const manager = new GroupAudioManager({
+      identity: {
+        userId: currentIdentity.userId,
+        groupId: currentIdentity.groupId,
+        name: currentIdentity.name,
+      },
+      callbacks: {
+        sendSignal: (targetUserId, signal) => wsClient.sendWebRtcSignal(targetUserId, signal),
+        onError: (_peerUserId, error) => {
+          console.warn('[intercom] group audio error:', error.message);
+        },
+      },
+    });
+
+    try {
+      await manager.start();
+      groupAudioRef.current = manager;
+      setPermissionError(null);
+    } catch (error) {
+      manager.dispose();
+      const message = error instanceof Error ? error.message : String(error);
+      setPermissionError(message || 'Unable to access microphone');
+    }
+  }, []);
+
+  const teardownGroupAudio = useCallback(() => {
+    Object.values(recoveryOfferTimersRef.current).forEach((timer) => clearTimeout(timer));
+    recoveryOfferTimersRef.current = {};
+
+    const manager = groupAudioRef.current;
+    groupAudioRef.current = null;
+    manager?.dispose();
+  }, []);
+
+  const startTalking = useCallback(async () => {
+    const manager = groupAudioRef.current;
+    if (!manager || !groupId || connectionStatus !== 'connected' || isTransmitting || channelBusy) return;
+
+    setPermissionError(null);
+    pendingPttRef.current = true;
+    wsClient.send({ type: 'ptt_start', mode: 'ptt' });
+
+    try {
+      await manager.setMicEnabled(true);
+      setIsTransmitting(true);
+      if (userId) {
+        setMembers((prev) => ({
+          ...prev,
+          [userId]: {
+            id: userId,
+            name: displayName || prev[userId]?.name || 'You',
+            isTalking: true,
+          },
+        }));
+        setActiveSpeaker({ id: userId, name: displayName || 'You', isTalking: true });
+      }
+    } catch (error) {
+      pendingPttRef.current = false;
+      await manager.setMicEnabled(false).catch(() => null);
+      wsClient.send({ type: 'ptt_end' });
+      const message = error instanceof Error ? error.message : String(error);
+      setPermissionError(message || 'Unable to access microphone');
+    }
+  }, [channelBusy, connectionStatus, displayName, groupId, isTransmitting, userId]);
+
+  const stopTalking = useCallback(async () => {
+    const manager = groupAudioRef.current;
+    if (!manager && !isTransmitting && !pendingPttRef.current) return;
+
+    pendingPttRef.current = false;
+    if (manager) {
+      await manager.setMicEnabled(false).catch(() => null);
+    }
+    setIsTransmitting(false);
+    wsClient.send({ type: 'ptt_end' });
+
+    if (userId) {
+      setMembers((prev) => {
+        if (!prev[userId]) return prev;
+        return {
+          ...prev,
+          [userId]: {
+            ...prev[userId],
+            isTalking: false,
+          },
+        };
+      });
+      setActiveSpeaker((current) => (current && current.id === userId ? null : current));
+    }
+  }, [isTransmitting, userId]);
+
+  const handleMemberSnapshot = useCallback((message: MemberSnapshotMessage) => {
+    const manager = groupAudioRef.current;
+    const onlineMembers = (message.members || []).filter((member) => member.online);
+
+    setMembers((prev) => {
+      const next: Record<string, MemberState> = {};
+      onlineMembers.forEach((member) => {
+        const memberId = member.user_id || member.userId;
+        if (!memberId) return;
+        next[memberId] = {
+          id: memberId,
+          name: member.name || prev[memberId]?.name || (memberId === userId ? displayName || 'You' : 'Teammate'),
+          isTalking: prev[memberId]?.isTalking ?? false,
+        };
+      });
+
+      if (userId && !next[userId]) {
+        next[userId] = {
+          id: userId,
+          name: displayName || prev[userId]?.name || 'You',
+          isTalking: prev[userId]?.isTalking ?? false,
+        };
+      }
+
+      return next;
+    });
+
+    onlineMembers.forEach((member) => {
+      const memberId = member.user_id || member.userId;
+      if (!memberId || memberId === userId || !manager) return;
+
+      manager.ensurePeer({ userId: memberId, name: member.name }, { createOffer: false }).catch((error) => {
+        console.warn('[intercom] ensurePeer from snapshot failed:', error);
+      });
+
+      clearRecoveryTimer(memberId);
+      if (userId < memberId) {
+        recoveryOfferTimersRef.current[memberId] = setTimeout(() => {
+          manager.ensurePeer({ userId: memberId, name: member.name }, { createOffer: true }).catch((error) => {
+            console.warn('[intercom] delayed recovery offer failed:', error);
+          });
+          clearRecoveryTimer(memberId);
+        }, 1200);
+      }
+    });
+  }, [clearRecoveryTimer, displayName, userId]);
+
+  const handlePresence = useCallback((message: PresenceMessage) => {
+    const manager = groupAudioRef.current;
+    const memberId = memberIdFromMessage(message);
+    if (!memberId) return;
+
+    if (message.type === 'member_joined') {
+      upsertMemberFromPresence(message, false);
+      if (memberId !== userId && manager) {
+        manager.ensurePeer({ userId: memberId, name: message.name }, { createOffer: true }).catch((error) => {
+          console.warn('[intercom] ensurePeer on join failed:', error);
+        });
+      }
+      return;
+    }
+
+    if (message.type === 'member_left') {
+      setMembers((prev) => {
+        const next = { ...prev };
+        delete next[memberId];
+        return next;
+      });
+      setActiveSpeaker((current) => (current && current.id === memberId ? null : current));
+      clearRecoveryTimer(memberId);
+      manager?.removePeer(memberId);
+    }
+  }, [clearRecoveryTimer, memberIdFromMessage, upsertMemberFromPresence, userId]);
+
+  const handleWebRtcSignal = useCallback((message: WebRtcSignalMessage) => {
+    const manager = groupAudioRef.current;
+    if (!manager || !message?.from_user_id || !message.signal) return;
+
+    manager.handleSignal(message.from_user_id, message.signal).catch((error) => {
+      console.warn('[intercom] handleSignal failed:', error);
+    });
+  }, []);
+
+  const handleMessage = useCallback((message: any) => {
+    if (!message?.type) return;
+
+    switch (message.type) {
+      case 'members_snapshot':
+        handleMemberSnapshot(message as MemberSnapshotMessage);
+        break;
+      case 'member_joined':
+      case 'member_left':
+        handlePresence(message as PresenceMessage);
+        break;
+      case 'webrtc_signal':
+        handleWebRtcSignal(message as WebRtcSignalMessage);
+        break;
+      case 'ptt_start': {
+        const senderId = memberIdFromMessage(message);
+        if (!senderId) return;
+        upsertMemberFromPresence(message, true);
+        setActiveSpeaker({
+          id: senderId,
+          name: message?.name || (senderId === userId ? displayName || 'You' : 'Teammate'),
+          isTalking: true,
+        });
+        break;
+      }
+      case 'ptt_end': {
+        const senderId = memberIdFromMessage(message);
+        if (!senderId) return;
+        setMembers((prev) => {
+          if (!prev[senderId]) return prev;
+          return {
+            ...prev,
+            [senderId]: {
+              ...prev[senderId],
+              isTalking: false,
+            },
+          };
+        });
+        setActiveSpeaker((current) => (current && current.id === senderId ? null : current));
+        setChannelBusy(false);
+        break;
+      }
+      case 'ptt_busy': {
+        setChannelBusy(true);
+        pendingPttRef.current = false;
+        groupAudioRef.current?.setMicEnabled(false).catch(() => null);
+        setIsTransmitting(false);
+        setActiveSpeaker(null);
+        if (userId) {
+          setMembers((prev) => {
+            if (!prev[userId]) return prev;
+            return {
+              ...prev,
+              [userId]: {
+                ...prev[userId],
+                isTalking: false,
+              },
+            };
+          });
+        }
+        setTimeout(() => setChannelBusy(false), 3000);
+        break;
+      }
+      default:
+        break;
+    }
+  }, [displayName, handleMemberSnapshot, handlePresence, handleWebRtcSignal, memberIdFromMessage, upsertMemberFromPresence, userId]);
 
   useEffect(() => {
     let mounted = true;
@@ -47,7 +321,7 @@ const IntercomScreen = () => {
         setIdentity({
           userId: (values.userId as string) || '',
           groupId: (values.groupId as string) || '',
-          name: (values.displayName as string) || ''
+          name: (values.displayName as string) || '',
         });
       } catch (error) {
         console.warn('Failed to load intercom identity', error);
@@ -67,7 +341,7 @@ const IntercomScreen = () => {
     return () => {
       wsClient.disconnect();
     };
-  }, [userId, groupId, displayName]);
+  }, [displayName, groupId, userId]);
 
   useEffect(() => {
     if (!userId) return;
@@ -76,133 +350,24 @@ const IntercomScreen = () => {
       [userId]: {
         id: userId,
         name: displayName || prev[userId]?.name || 'You',
-        isTalking: prev[userId]?.isTalking ?? false
-      }
+        isTalking: prev[userId]?.isTalking ?? false,
+      },
     }));
   }, [displayName, userId]);
 
   useEffect(() => {
-    return () => {
-      if (recordingRef.current) {
-        recordingRef.current.stopAndUnloadAsync().catch(() => null);
-      }
-    };
-  }, []);
-
-  const enqueuePlayback = useCallback((base64Data: string) => {
-    if (!base64Data) return;
-    playbackQueue.current = playbackQueue.current.then(async () => {
-      const cacheDir = FileSystem.cacheDirectory ?? '';
-      const tempFile = `${cacheDir}ptt-${Date.now()}-${Math.random().toString(36).slice(2)}.aac`;
-      try {
-        await FileSystem.writeAsStringAsync(tempFile, base64Data, {
-          encoding: FileSystem.EncodingType.Base64
-        });
-        // Switch audio session to playback mode before playing
-        await Audio.setAudioModeAsync({
-          allowsRecordingIOS: false,
-          playsInSilentModeIOS: true,
-          interruptionModeIOS: InterruptionModeIOS.DoNotMix,
-          interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
-          shouldDuckAndroid: true,
-          playThroughEarpieceAndroid: false,
-          staysActiveInBackground: false,
-        });
-        const { sound } = await Audio.Sound.createAsync(
-          { uri: tempFile },
-          { shouldPlay: true }  // play immediately on load
-        );
-        await new Promise<void>((resolve) => {
-          sound.setOnPlaybackStatusUpdate((status) => {
-            if (!status.isLoaded) return;
-            if (status.didJustFinish) {  // only resolve when actually finished
-              sound.setOnPlaybackStatusUpdate(null);
-              resolve();
-            }
-          });
-        });
-        await sound.unloadAsync();
-      } catch (error) {
-        console.warn('Failed to play audio chunk', error);
-      } finally {
-        await FileSystem.deleteAsync(tempFile, { idempotent: true }).catch(() => null);
-      }
+    if (!userId || !groupId || connectionStatus !== 'connected') return;
+    initializeGroupAudio(identity).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      setPermissionError(message || 'Unable to initialize audio');
     });
-  }, []);
+  }, [connectionStatus, groupId, identity, initializeGroupAudio, userId]);
 
-  const handleMessage = useCallback((message: any) => {
-    if (!message?.type) return;
-    const { userId: senderId, name } = message;
-
-    switch (message.type) {
-      case 'member_joined':
-        if (!senderId) return;
-        setMembers((prev) => ({
-          ...prev,
-          [senderId]: {
-            id: senderId,
-            name: name || prev[senderId]?.name || 'Teammate',
-            isTalking: prev[senderId]?.isTalking ?? false
-          }
-        }));
-        break;
-      case 'member_left':
-        if (!senderId) return;
-        setMembers((prev) => {
-          const next = { ...prev };
-          delete next[senderId];
-          return next;
-        });
-        setActiveSpeaker((current) => (current && current.id === senderId ? null : current));
-        break;
-      case 'ptt_start':
-        if (!senderId) return;
-        setMembers((prev) => ({
-          ...prev,
-          [senderId]: {
-            id: senderId,
-            name: name || prev[senderId]?.name || 'Teammate',
-            isTalking: true
-          }
-        }));
-        setActiveSpeaker({ id: senderId, name: name || 'Teammate', isTalking: true });
-        break;
-      case 'ptt_end':
-        if (!senderId) return;
-        setMembers((prev) => {
-          if (!prev[senderId]) return prev;
-          return {
-            ...prev,
-            [senderId]: {
-              ...prev[senderId],
-              isTalking: false
-            }
-          };
-        });
-        setActiveSpeaker((current) => (current && current.id === senderId ? null : current));
-        setChannelBusy(false);
-        break;
-      case 'ptt_busy':
-        // Another user holds the channel floor — stop local recording
-        setIsRecording(false);
-        setChannelBusy(true);
-        setTimeout(() => setChannelBusy(false), 3000);
-        if (recordingRef.current) {
-          recordingRef.current.stopAndUnloadAsync().catch(() => null);
-          recordingRef.current = null;
-        }
-        // Clear any active speaker indicator — channel is busy with another user
-        setActiveSpeaker(null);
-        break;
-      case 'audio_chunk':
-        if (typeof message.data === 'string') {
-          enqueuePlayback(message.data);
-        }
-        break;
-      default:
-        break;
-    }
-  }, [enqueuePlayback]);
+  useEffect(() => {
+    return () => {
+      teardownGroupAudio();
+    };
+  }, [teardownGroupAudio]);
 
   useEffect(() => {
     const statusListener = (payload: any) => {
@@ -224,7 +389,7 @@ const IntercomScreen = () => {
       animation = Animated.loop(
         Animated.sequence([
           Animated.timing(pulseScale, { toValue: 1.1, duration: 500, useNativeDriver: true }),
-          Animated.timing(pulseScale, { toValue: 1, duration: 500, useNativeDriver: true })
+          Animated.timing(pulseScale, { toValue: 1, duration: 500, useNativeDriver: true }),
         ])
       );
       animation.start();
@@ -236,126 +401,6 @@ const IntercomScreen = () => {
       animation?.stop();
     };
   }, [activeSpeaker, pulseScale]);
-
-  const startRecording = useCallback(async () => {
-    if (isRecording || !groupId || connectionStatus !== 'connected') return;
-    try {
-      setPermissionError(null);
-      const permission = await Audio.requestPermissionsAsync();
-      if (permission.status !== 'granted') {
-        setPermissionError('Microphone permission denied');
-        return;
-      }
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        interruptionModeIOS: InterruptionModeIOS.DoNotMix,
-        interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
-        staysActiveInBackground: false
-      });
-
-      const recording = new Audio.Recording();
-      await recording.prepareToRecordAsync({
-        isMeteringEnabled: false,
-        android: {
-          extension: '.aac',
-          outputFormat: Audio.AndroidOutputFormat.AAC_ADTS,
-          audioEncoder: Audio.AndroidAudioEncoder.AAC,
-          sampleRate: 16000,
-          numberOfChannels: 1,
-          bitRate: 32000,
-        },
-        ios: {
-          extension: '.aac',
-          outputFormat: Audio.IOSOutputFormat.MPEG4AAC,
-          audioQuality: Audio.IOSAudioQuality.MEDIUM,
-          sampleRate: 16000,
-          numberOfChannels: 1,
-          bitRate: 32000,
-          linearPCMBitDepth: 16,
-          linearPCMIsBigEndian: false,
-          linearPCMIsFloat: false,
-        },
-        web: {
-          mimeType: 'audio/webm',
-          bitsPerSecond: 32000,
-        },
-      });
-      await recording.startAsync();
-      recordingRef.current = recording;
-      setIsRecording(true);
-
-      wsClient.send({ type: 'ptt_start' });
-      if (userId) {
-        setMembers((prev) => ({
-          ...prev,
-          [userId]: {
-            id: userId,
-            name: displayName || prev[userId]?.name || 'You',
-            isTalking: true
-          }
-        }));
-        setActiveSpeaker({ id: userId, name: displayName || 'You', isTalking: true });
-      }
-    } catch (error) {
-      console.error('Failed to start recording', error);
-      setPermissionError('Unable to access microphone');
-    }
-  }, [connectionStatus, displayName, groupId, isRecording, userId]);
-
-  const stopRecording = useCallback(async () => {
-    const activeRecording = recordingRef.current;
-    if (!activeRecording && !isRecording) return;
-
-    try {
-      if (activeRecording) {
-        await activeRecording.stopAndUnloadAsync();
-        const uri = activeRecording.getURI();
-        if (uri) {
-          const base64 = await FileSystem.readAsStringAsync(uri, {
-            encoding: FileSystem.EncodingType.Base64
-          });
-          if (base64) {
-            wsClient.send({ type: 'audio_chunk', data: base64 });
-            bleBridge.mirrorPttChunk(base64);
-          }
-          await FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => null);
-        }
-      }
-    } catch (error) {
-      console.error('Failed to stop recording', error);
-    } finally {
-      recordingRef.current = null;
-      setIsRecording(false);
-      // Restore audio session to playback mode so incoming audio can be heard
-      Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
-        playsInSilentModeIOS: true,
-        interruptionModeIOS: InterruptionModeIOS.DoNotMix,
-        interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
-        staysActiveInBackground: false,
-      }).catch(() => null);
-      wsClient.send({ type: 'ptt_end' });
-      if (userId) {
-        setMembers((prev) => {
-          if (!prev[userId]) return prev;
-          return {
-            ...prev,
-            [userId]: {
-              ...prev[userId],
-              isTalking: false
-            }
-          };
-        });
-        setActiveSpeaker((current) => (current && current.id === userId ? null : current));
-      }
-    }
-  }, [isRecording, userId]);
 
   const buttonDisabled = !groupId || connectionStatus !== 'connected';
 
@@ -420,7 +465,6 @@ const IntercomScreen = () => {
         </View>
       </ScrollView>
 
-      {/* PTT controls fixed to bottom — never scrolls off-screen (#34) */}
       <View style={styles.controls}>
         {channelBusy ? (
           <Text style={styles.busyText}>Channel busy — someone else is talking</Text>
@@ -428,16 +472,16 @@ const IntercomScreen = () => {
           <Text style={styles.status}>{statusText}</Text>
         )}
         <Pressable
-          onPressIn={startRecording}
-          onPressOut={stopRecording}
+          onPressIn={startTalking}
+          onPressOut={stopTalking}
           disabled={buttonDisabled}
           style={({ pressed }) => [
             styles.pttButton,
-            (isRecording || pressed) && styles.pttButtonActive,
-            buttonDisabled && styles.pttButtonDisabled
+            (isTransmitting || pressed) && styles.pttButtonActive,
+            buttonDisabled && styles.pttButtonDisabled,
           ]}
         >
-          <Text style={styles.pttLabel}>{isRecording ? 'RELEASE TO SEND' : 'HOLD TO TALK'}</Text>
+          <Text style={styles.pttLabel}>{isTransmitting ? 'RELEASE TO SEND' : 'HOLD TO TALK'}</Text>
         </Pressable>
         {permissionError ? <Text style={styles.errorText}>{permissionError}</Text> : null}
       </View>
@@ -448,15 +492,15 @@ const IntercomScreen = () => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#06121f'
+    backgroundColor: '#06121f',
   },
   scrollArea: {
-    flex: 1
+    flex: 1,
   },
   scrollContent: {
     padding: 16,
     gap: 16,
-    paddingBottom: 100 // space for bottom PTT bar
+    paddingBottom: 100,
   },
   infoBanner: {
     backgroundColor: '#0d2034',
@@ -464,22 +508,22 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     paddingHorizontal: 14,
     borderLeftWidth: 3,
-    borderLeftColor: '#1e88e5'
+    borderLeftColor: '#1e88e5',
   },
   infoText: {
     color: '#9fb4cc',
-    fontSize: 13
+    fontSize: 13,
   },
   card: {
     backgroundColor: '#10243b',
     borderRadius: 16,
-    padding: 16
+    padding: 16,
   },
   heading: {
     color: '#fff',
     fontSize: 18,
     fontWeight: '700',
-    marginBottom: 12
+    marginBottom: 12,
   },
   memberRow: {
     flexDirection: 'row',
@@ -487,56 +531,56 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: 12,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#1e3a5f'
+    borderBottomColor: '#1e3a5f',
   },
   memberInfo: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8
+    gap: 8,
   },
   onlineDot: {
     width: 10,
     height: 10,
     borderRadius: 5,
-    backgroundColor: '#4caf50'
+    backgroundColor: '#4caf50',
   },
   memberName: {
     color: '#fff',
     fontSize: 16,
-    fontWeight: '600'
+    fontWeight: '600',
   },
   memberStatus: {
     color: '#9fb4cc',
-    fontSize: 14
+    fontSize: 14,
   },
   waveform: {
     flexDirection: 'row',
     alignItems: 'flex-end',
-    gap: 4
+    gap: 4,
   },
   waveBar: {
     width: 6,
     height: 12,
     borderRadius: 3,
-    backgroundColor: '#ff9800'
+    backgroundColor: '#ff9800',
   },
   waveBarTall: {
-    height: 20
+    height: 20,
   },
   emptyText: {
     color: '#7f8ea3',
     textAlign: 'center',
-    marginTop: 8
+    marginTop: 8,
   },
   speakerCard: {
     backgroundColor: '#0d2034',
     borderRadius: 16,
-    padding: 16
+    padding: 16,
   },
   speakerRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 16
+    gap: 16,
   },
   pulseCircle: {
     width: 32,
@@ -545,12 +589,12 @@ const styles = StyleSheet.create({
     backgroundColor: '#ff9800',
     shadowColor: '#ff9800',
     shadowOpacity: 0.7,
-    shadowRadius: 14
+    shadowRadius: 14,
   },
   speakerName: {
     color: '#fff',
     fontSize: 18,
-    fontWeight: '700'
+    fontWeight: '700',
   },
   controls: {
     alignItems: 'center',
@@ -559,16 +603,16 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
     backgroundColor: '#06121f',
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#1e3a5f'
+    borderTopColor: '#1e3a5f',
   },
   status: {
-    color: '#9fb4cc'
+    color: '#9fb4cc',
   },
   busyText: {
     color: '#ff9800',
     fontWeight: '600',
     fontSize: 14,
-    textAlign: 'center'
+    textAlign: 'center',
   },
   pttButton: {
     width: 180,
@@ -579,22 +623,22 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     shadowColor: '#1e88e5',
     shadowOpacity: 0.6,
-    shadowRadius: 20
+    shadowRadius: 20,
   },
   pttButtonActive: {
-    backgroundColor: '#1565c0'
+    backgroundColor: '#1565c0',
   },
   pttButtonDisabled: {
-    opacity: 0.4
+    opacity: 0.4,
   },
   pttLabel: {
     color: '#fff',
     fontWeight: '700',
-    fontSize: 18
+    fontSize: 18,
   },
   errorText: {
-    color: '#ff8a80'
-  }
+    color: '#ff8a80',
+  },
 });
 
 export default IntercomScreen;
