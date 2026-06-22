@@ -245,17 +245,22 @@ export class GroupAudioManager {
       if (signal.kind === 'offer') {
         const isStable = (anyPc.signalingState === 'stable');
 
-        // Perfect Negotiation: if both sides create offers at once (glare),
-        // the lexicographically smaller userId keeps its offer;
-        // the larger yields and accepts the incoming offer.
-        if (!isStable) {
-          if (peer.makingOffer && this.identity.userId > fromUserId) {
-            // We yield — roll back our in-progress offer and accept theirs.
-            peer.makingOffer = false;
+        // Perfect Negotiation glare handling: if we have a local offer
+        // in flight when a remote offer arrives, the lexicographically
+        // smaller userId keeps its offer; the larger rolls back and
+        // accepts. (We check signalingState instead of peer.makingOffer
+        // because makingOffer is already false by the time the remote
+        // offer reaches us via WS relay.)
+        if (!isStable && anyPc.signalingState === 'have-local-offer') {
+          if (this.identity.userId > fromUserId) {
+            // We have the larger userId — roll back and accept.
+            // Rollback via setLocalDescription({ type: 'rollback' }) or
+            // by setting remote desc first (Chrome-compatible path).
             await anyPc.setRemoteDescription(
               new RTCSessionDescription({ type: 'offer', sdp: signal.sdp })
             );
             peer.remoteDescriptionSet = true;
+            peer.makingOffer = false;
             await this.drainIceQueue(peer);
             const answer = await anyPc.createAnswer();
             await anyPc.setLocalDescription(answer);
@@ -265,8 +270,8 @@ export class GroupAudioManager {
             }
             return;
           }
-          // We have initiative or someone else is already in-flight —
-          // politely ignore this offer. The peer will retry if needed.
+          // We have the smaller userId — our offer wins. Ignore theirs;
+          // they will roll back when they hit this same logic.
           return;
         }
 
