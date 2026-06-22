@@ -14,6 +14,8 @@ const goggleSockets = new Map();
 const centralSockets = new Map();
 // gogglesId → userId that registered this goggle (ownership map)
 const gogglesOwners = new Map();
+// Per-group channel floor holder (prevents simultaneous PTT cross-talk)
+const channelFloor = new Map();
 
 async function ensureUserAllowed(userId) {
   if (!userId) {
@@ -167,6 +169,12 @@ async function handleMessage(ws, msg) {
     }
 
     case 'ptt_start': {
+      const floorHolder = channelFloor.get(msg.groupId);
+      if (floorHolder && floorHolder !== msg.userId) {
+        ws.send(JSON.stringify({ type: 'ptt_busy', userId: floorHolder }));
+        break;
+      }
+      channelFloor.set(msg.groupId, msg.userId);
       broadcastToGroup(msg.groupId, {
         type: 'ptt_start',
         userId: msg.userId,
@@ -176,6 +184,9 @@ async function handleMessage(ws, msg) {
     }
 
     case 'ptt_end': {
+      if (channelFloor.get(msg.groupId) === msg.userId) {
+        channelFloor.delete(msg.groupId);
+      }
       broadcastToGroup(msg.groupId, {
         type: 'ptt_end',
         userId: msg.userId,
@@ -184,6 +195,10 @@ async function handleMessage(ws, msg) {
     }
 
     case 'audio_chunk': {
+      // Only the floor holder may send audio
+      if (channelFloor.get(msg.groupId) !== msg.userId) {
+        break;
+      }
       const nextSeq = (speakerSeq.get(msg.userId) || 0) + 1;
       speakerSeq.set(msg.userId, nextSeq);
       broadcastToGroup(msg.groupId, {
@@ -338,6 +353,14 @@ function handleDisconnect(ws) {
   if (ws.userId) {
     userSockets.delete(ws.userId);
     speakerSeq.delete(ws.userId);
+    // Release channel floor if this user held it
+    if (ws.groupId && channelFloor.get(ws.groupId) === ws.userId) {
+      channelFloor.delete(ws.groupId);
+      broadcastToGroup(ws.groupId, {
+        type: 'ptt_end',
+        userId: ws.userId,
+      });
+    }
   }
   if (ws.groupId && rooms.has(ws.groupId)) {
     const room = rooms.get(ws.groupId);

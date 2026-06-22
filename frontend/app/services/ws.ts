@@ -19,13 +19,20 @@ class FlowWebSocket {
   connect(userId: string, groupId: string, name: string) {
     if (!userId || !groupId) return;
 
-    this.manuallyDisconnected = false;
-    this.reconnectDelay = MIN_RECONNECT_DELAY;
+    // Prevent double-connect: detach old socket's onclose BEFORE closing
+    // so the stale async onclose cannot fire a reconnect after we open a new socket (#27, #29)
     this._clearReconnectTimer();
+    this.reconnectDelay = MIN_RECONNECT_DELAY;
 
     if (this.socket) {
+      this.socket.onclose = null;   // detach old handler — no stale reconnect
+      this.socket.onerror = null;
       this.socket.close();
+      this.socket = null;
     }
+
+    // Reset for the new socket — reconnect on genuine network drops
+    this.manuallyDisconnected = false;
 
     this.identity = { userId, groupId, name };
     this._openSocket();
@@ -59,12 +66,16 @@ class FlowWebSocket {
     };
 
     this.socket.onclose = () => {
+      const wasManual = this.manuallyDisconnected;
       this.emit('status', { state: 'closed' });
-      if (!this.manuallyDisconnected && this.identity.userId && this.identity.groupId) {
+      if (!wasManual && this.identity.userId && this.identity.groupId) {
+        // Add jitter (±20%) to prevent thundering-herd reconnects (#29)
+        const jitter = 0.8 + Math.random() * 0.4;
+        const delay = Math.round(this.reconnectDelay * jitter);
         this.reconnectTimeout = setTimeout(() => {
           this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY);
           this._openSocket();
-        }, this.reconnectDelay);
+        }, delay);
       }
     };
   }
