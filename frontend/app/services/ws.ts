@@ -19,19 +19,19 @@ class FlowWebSocket {
   connect(userId: string, groupId: string, name: string) {
     if (!userId || !groupId) return;
 
-    // Prevent double-connect: clear reconnect timer BEFORE closing old socket
-    // so onclose doesn't fire a stale reconnect attempt (#27, #29)
-    this.manuallyDisconnected = true; // suppress reconnect during intentional close
+    // Prevent double-connect: detach old socket's onclose BEFORE closing
+    // so the stale async onclose cannot fire a reconnect after we open a new socket (#27, #29)
     this._clearReconnectTimer();
     this.reconnectDelay = MIN_RECONNECT_DELAY;
 
     if (this.socket) {
+      this.socket.onclose = null;   // detach old handler — no stale reconnect
+      this.socket.onerror = null;
       this.socket.close();
       this.socket = null;
     }
 
     this.identity = { userId, groupId, name };
-    this.manuallyDisconnected = false;
     this._openSocket();
   }
 

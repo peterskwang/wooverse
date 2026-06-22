@@ -357,14 +357,7 @@ const IntercomScreen = () => {
         <View style={styles.infoBanner}>
           <Text style={styles.infoText}>📱 Voice works phone-to-phone · BLE iPod for testing only</Text>
         </View>
-        <View style={styles.guideCard}>
-          <Text style={styles.guideTitle}>How to test voice</Text>
-          <Text style={styles.guideStep}><Text style={styles.guideNum}>1. </Text>Both phones open the app and go to <Text style={styles.guideBold}>Settings</Text> — enter the same Group ID and a display name, then tap Save.</Text>
-          <Text style={styles.guideStep}><Text style={styles.guideNum}>2. </Text>Make sure both phones show <Text style={styles.guideConnected}>Connected to group intercom</Text> at the bottom.</Text>
-          <Text style={styles.guideStep}><Text style={styles.guideNum}>3. </Text>On one phone, <Text style={styles.guideBold}>hold the big blue button</Text> to talk. Release to send.</Text>
-          <Text style={styles.guideStep}><Text style={styles.guideNum}>4. </Text>The other phone will play the audio and show the speaker's name under <Text style={styles.guideBold}>Now Talking</Text>.</Text>
-          <Text style={styles.guideStep}><Text style={styles.guideNum}>5. </Text>Swap roles to test both directions. Both phones should appear under <Text style={styles.guideBold}>Group Members</Text>.</Text>
-        </View>
+
         <View style={styles.card}>
           <Text style={styles.heading}>Group Members</Text>
           <FlatList
@@ -450,35 +443,6 @@ const styles = StyleSheet.create({
   infoText: {
     color: '#9fb4cc',
     fontSize: 13
-  },
-  guideCard: {
-    backgroundColor: '#0d2034',
-    borderRadius: 12,
-    padding: 14,
-    gap: 8
-  },
-  guideTitle: {
-    color: '#fff',
-    fontSize: 15,
-    fontWeight: '700',
-    marginBottom: 4
-  },
-  guideStep: {
-    color: '#9fb4cc',
-    fontSize: 13,
-    lineHeight: 20
-  },
-  guideNum: {
-    color: '#1e88e5',
-    fontWeight: '700'
-  },
-  guideBold: {
-    color: '#fff',
-    fontWeight: '600'
-  },
-  guideConnected: {
-    color: '#4caf50',
-    fontWeight: '600'
   },
   card: {
     backgroundColor: '#10243b',
@@ -575,9 +539,9 @@ const styles = StyleSheet.create({
     color: '#9fb4cc'
   },
   pttButton: {
-    width: 220,
-    height: 220,
-    borderRadius: 110,
+    width: 180,
+    height: 180,
+    borderRadius: 90,
     backgroundColor: '#1e88e5',
     alignItems: 'center',
     justifyContent: 'center',
