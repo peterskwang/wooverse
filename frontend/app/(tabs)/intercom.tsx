@@ -183,9 +183,8 @@ const IntercomScreen = () => {
           recordingRef.current.stopAndUnloadAsync().catch(() => null);
           recordingRef.current = null;
         }
-        if (activeSpeaker?.id === userId) {
-          setActiveSpeaker(null);
-        }
+        // Clear any active speaker indicator — channel is busy with another user
+        setActiveSpeaker(null);
         break;
       case 'audio_chunk':
         if (typeof message.data === 'string') {
