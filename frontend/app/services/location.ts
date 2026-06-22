@@ -10,6 +10,9 @@ export interface Coordinates {
 }
 
 let locationSubscription: Location.LocationSubscription | null = null;
+let lastWsLocationSentAt = 0;
+
+const MIN_WS_LOCATION_INTERVAL_MS = 3000;
 
 export const requestPermissions = async () => {
   const { status } = await Location.requestForegroundPermissionsAsync();
@@ -42,15 +45,23 @@ export const startLocationTracking = async (onUpdate?: (coords: Coordinates) => 
 
       onUpdate?.(coords);
 
-      if (wsClient.isConnected()) {
-        wsClient.send({
+      const now = Date.now();
+      if (wsClient.isConnected() && now - lastWsLocationSentAt >= MIN_WS_LOCATION_INTERVAL_MS) {
+        lastWsLocationSentAt = now;
+        const payload: Record<string, any> = {
           type: 'location',
           lat: coords.latitude,
           lng: coords.longitude,
-          altitude_m: coords.altitude,
-          speed_ms: coords.speed,
-          ts: Date.now(),
-        });
+          sent_at: now,
+          ts: now,
+        };
+        if (coords.altitude != null) {
+          payload.altitude_m = coords.altitude;
+        }
+        if (coords.speed != null) {
+          payload.speed_ms = coords.speed;
+        }
+        wsClient.send(payload);
       }
     }
   );
@@ -63,4 +74,5 @@ export const stopLocationTracking = () => {
     locationSubscription.remove();
     locationSubscription = null;
   }
+  lastWsLocationSentAt = 0;
 };

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/auth');
 const { pool } = require('../config/db');
+const { getGroupMemberPresence } = require('../services/ws');
 
 function generateInviteCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -97,6 +98,28 @@ router.get('/mine', requireAuth, async (req, res) => {
     );
     res.json(result.rows);
   } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get full member roster with live presence and last known location
+// GET /api/groups/:groupId/members
+router.get('/:groupId/members', requireAuth, async (req, res) => {
+  const { groupId } = req.params;
+
+  try {
+    const membership = await pool.query(
+      'SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2',
+      [groupId, req.user.userId]
+    );
+    if (membership.rowCount === 0) {
+      return res.status(403).json({ error: 'Not a group member' });
+    }
+
+    const members = await getGroupMemberPresence(groupId);
+    res.json({ members });
+  } catch (e) {
+    console.error('[groups] members error:', e.message);
     res.status(500).json({ error: 'Server error' });
   }
 });

@@ -131,6 +131,7 @@ const SummaryRow = ({ label, value }: SummaryRowProps) => (
 
 const MapScreen = () => {
   const [coords, setCoords] = useState<Coordinates | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
   const [groupId, setGroupId] = useState<string | null>(null);
   const [runSnap, setRunSnap] = useState<RunSnapshot | null>(null);
   const [teammates, setTeammates] = useState<Teammate[]>([]);
@@ -183,13 +184,15 @@ const MapScreen = () => {
     const loadGroup = async () => {
       try {
         const storedGroupId = await AsyncStorage.getItem('groupId');
+        const storedUserId = await AsyncStorage.getItem('userId');
         if (mounted) {
           setGroupId(storedGroupId);
+          setUserId(storedUserId);
           setLoading(false);
         }
         if (storedGroupId) {
-          await fetchTeammates(storedGroupId);
-          interval = setInterval(() => fetchTeammates(storedGroupId), 10000);
+          await fetchTeammates(storedGroupId, storedUserId);
+          interval = setInterval(() => fetchTeammates(storedGroupId, storedUserId), 10000);
         }
       } catch (error) {
         console.error('Failed to load group', error);
@@ -243,18 +246,48 @@ const MapScreen = () => {
     };
   }, []);
 
-  const fetchTeammates = async (activeGroupId: string) => {
+  useEffect(() => {
+    const unsubscribe = wsClient.onLocation((message) => {
+      const incomingUserId = message.user_id || message.userId;
+      const lat = Number(message.lat);
+      const lng = Number(message.lng);
+      if (!incomingUserId || incomingUserId === userId || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return;
+      }
+
+      setTeammates((prev) => {
+        const existing = prev.find((m) => m.id === incomingUserId);
+        const updated: Teammate = {
+          id: incomingUserId,
+          name: existing?.name || 'Teammate',
+          latitude: lat,
+          longitude: lng,
+        };
+        if (!existing) {
+          return [...prev, updated];
+        }
+        return prev.map((m) => (m.id === incomingUserId ? { ...m, ...updated } : m));
+      });
+    });
+
+    return unsubscribe;
+  }, [userId]);
+
+  const fetchTeammates = async (activeGroupId: string, currentUserId?: string | null) => {
     try {
-      const response = await api.get(`/api/locations/${activeGroupId}`);
-      const raw: any[] = response.data?.teammates || response.data || [];
+      const response = await api.get(`/api/groups/${activeGroupId}/members`);
+      const raw: any[] = response.data?.members || response.data?.teammates || response.data || [];
       // Normalise backend field names (lat/lng) to frontend interface (latitude/longitude)
       const list: Teammate[] = Array.isArray(raw)
-        ? raw.map((m) => ({
-            id: m.user_id || m.id,
-            name: m.name,
-            latitude: m.latitude ?? m.lat,
-            longitude: m.longitude ?? m.lng,
-          }))
+        ? raw
+            .map((m) => ({
+              id: m.user_id || m.userId || m.id,
+              name: m.name,
+              latitude: Number(m.latitude ?? m.lat),
+              longitude: Number(m.longitude ?? m.lng),
+            }))
+            .filter((m) => m.id && Number.isFinite(Number(m.latitude)) && Number.isFinite(Number(m.longitude)))
+            .filter((m) => m.id !== currentUserId)
         : [];
       setTeammates(list);
       setFetchError(null);
