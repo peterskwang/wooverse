@@ -91,6 +91,16 @@ export default function SosPage() {
     };
   }, [loadEvents]);
 
+  useEffect(() => {
+    if (wsStatus === 'connected') return undefined;
+
+    const pollTimer = window.setInterval(() => {
+      loadEvents(false);
+    }, 30000);
+
+    return () => window.clearInterval(pollTimer);
+  }, [loadEvents, wsStatus]);
+
   const activeEvents = events.filter((e) => !e.resolved_at);
   const activeMapEvents = activeEvents.filter(hasCoordinates);
   const activeCount = activeEvents.length;
@@ -149,7 +159,10 @@ export default function SosPage() {
             wsStatus === 'connected' ? 'bg-green-400' : wsStatus === 'connecting' ? 'bg-yellow-400' : 'bg-red-400'
           }`}
         />
-        <span className="text-slate-400">Live SOS feed {wsStatus}</span>
+        <span className="text-slate-400">
+          Live SOS feed {wsStatus}
+          {wsStatus !== 'connected' && ' - polling every 30s'}
+        </span>
       </div>
       {loading && <p className="text-slate-400">Loading...</p>}
       {error && <p className="text-red-400">{error}</p>}

@@ -25,6 +25,7 @@
 - **Manual SOS:** SOSScreen.tsx → POST /api/sos/trigger → sos_alerts table
 - **SOS Alert Flow:** Trigger → store in DB → push notification to group → WebSocket broadcast
 - **SOS Resolution:** POST /api/sos/resolve → updates resolved_at
+- **SOS Admin Map + Resolve Flow:** Admin SOS page uses Leaflet active-event pins, admin resolve buttons, authenticated WS admin room, and broadcastToRoom refresh broadcasts.
 - **DB Migration:** 002_phase3.sql — sos_alerts table
 - Built: 2026-04
 
