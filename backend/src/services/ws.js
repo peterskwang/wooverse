@@ -171,7 +171,7 @@ async function handleMessage(ws, msg) {
     case 'ptt_start': {
       const floorHolder = channelFloor.get(msg.groupId);
       if (floorHolder && floorHolder !== msg.userId) {
-        sendTo(ws, { type: 'ptt_busy', userId: floorHolder });
+        ws.send(JSON.stringify({ type: 'ptt_busy', userId: floorHolder }));
         break;
       }
       channelFloor.set(msg.groupId, msg.userId);
@@ -195,6 +195,10 @@ async function handleMessage(ws, msg) {
     }
 
     case 'audio_chunk': {
+      // Only the floor holder may send audio
+      if (channelFloor.get(msg.groupId) !== msg.userId) {
+        break;
+      }
       const nextSeq = (speakerSeq.get(msg.userId) || 0) + 1;
       speakerSeq.set(msg.userId, nextSeq);
       broadcastToGroup(msg.groupId, {

@@ -172,6 +172,14 @@ const IntercomScreen = () => {
         });
         setActiveSpeaker((current) => (current && current.id === senderId ? null : current));
         break;
+      case 'ptt_busy':
+        // Another user holds the channel floor — stop local recording
+        setIsRecording(false);
+        if (recordingRef.current) {
+          recordingRef.current.stopAndUnloadAsync().catch(() => null);
+          recordingRef.current = null;
+        }
+        break;
       case 'audio_chunk':
         if (typeof message.data === 'string') {
           enqueuePlayback(message.data);
