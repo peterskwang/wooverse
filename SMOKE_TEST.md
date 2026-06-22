@@ -17,6 +17,8 @@ Argus gate: if a PR or release does not include a completed smoke test section �
 - [ ] iOS → Android: Phone A (iOS) speaks → Phone B (Android) hears it
 - [ ] Android → iOS: Phone A (Android) speaks → Phone B (iOS) hears it
 - [ ] Release PTT → channel shows clear, "Now Talking" resets
+- [ ] PTT floor lock: Phone A holds PTT → Phone B tries PTT → gets "channel busy" indicator
+- [ ] PTT floor release: Phone A disconnects → floor auto-releases, Phone B can talk
 
 ### iPod / AirPod
 - [ ] Tap "Start Advertising" → status changes to "Advertising FLOW service"
