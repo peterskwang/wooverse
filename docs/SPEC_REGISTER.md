@@ -53,3 +53,4 @@
 - [ ] Slope difficulty overlay
 - [ ] Friend system (add/follow/search)
 - [ ] Battery optimization for GPS polling
+- [x] Phase 2 PR B: WebRTC Opus intercom (#70)
