@@ -62,6 +62,14 @@ const IntercomScreen = () => {
   }, []);
 
   useEffect(() => {
+    if (!userId || !groupId) return;
+    wsClient.connect(userId, groupId, displayName);
+    return () => {
+      wsClient.disconnect();
+    };
+  }, [userId, groupId, displayName]);
+
+  useEffect(() => {
     if (!userId) return;
     setMembers((prev) => ({
       ...prev,
