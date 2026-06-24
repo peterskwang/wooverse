@@ -26,6 +26,7 @@ const IntercomScreen = () => {
   const [members, setMembers] = useState<Record<string, MemberState>>({});
   const [activeSpeaker, setActiveSpeaker] = useState<MemberState | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error' | 'closed'>(wsClient.getState());
+  const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
   const [isTransmitting, setIsTransmitting] = useState(false);
   const [channelBusy, setChannelBusy] = useState(false);
   const [intercomAlwaysOn, setIntercomAlwaysOn] = useState(false);
@@ -445,20 +446,19 @@ const IntercomScreen = () => {
   }, []);
 
   useEffect(() => {
-    if (intercomAlwaysOn && (isTransmitting || pendingPttRef.current)) {
-      stopTalking().catch(() => null);
-    }
     const manager = groupAudioRef.current;
     if (!manager) return;
 
-    const nextMode: GroupAudioMode = intercomAlwaysOn ? 'always_on' : 'ptt';
+    const alwaysOnActive = intercomAlwaysOn && !fallbackReason && connectionStatus === 'connected' && appState === 'active';
+    const nextMode: GroupAudioMode = alwaysOnActive ? 'always_on' : 'ptt';
     manager.setMode(nextMode).catch((error) => {
       console.warn('[intercom] setMode failed:', error);
     });
-  }, [fallbackReason, intercomAlwaysOn, isTransmitting, stopTalking]);
+  }, [appState, connectionStatus, fallbackReason, intercomAlwaysOn]);
 
   useEffect(() => {
     const handleAppState = (nextState: AppStateStatus) => {
+      setAppState(nextState);
       const manager = groupAudioRef.current;
       if (!manager) return;
 
