@@ -209,10 +209,14 @@ export default function SosPage() {
   };
 
   const resolveEvent = async (id: string) => {
+    if (!adminUserId) {
+      setError('Admin user ID is required');
+      return;
+    }
     setResolvingId(id);
     setError('');
     try {
-      if (adminUserId && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({
           type: 'sos_resolve',
           sos_id: id,
