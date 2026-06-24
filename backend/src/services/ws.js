@@ -1,5 +1,19 @@
 const { WebSocketServer } = require('ws');
 const { pool } = require('../config/db');
+const {
+  DEFAULT_CHANNEL_ID,
+  listChannels,
+  requestToken,
+  releaseToken,
+  isTokenHolder,
+  getCurrentHolder,
+  createChannel,
+  deleteChannel,
+  muteUser,
+  unmuteUser,
+  forceRotate,
+  releaseUserFromAll,
+} = require('./channels');
 
 // In-memory room registry: groupId → Set<ws>
 const rooms = new Map();
@@ -16,8 +30,108 @@ const goggleSockets = new Map();
 const centralSockets = new Map();
 // gogglesId → userId that registered this goggle (ownership map)
 const gogglesOwners = new Map();
-// Per-group channel floor holder (prevents simultaneous PTT cross-talk)
-const channelFloor = new Map();
+function safeSend(socket, payload) {
+  if (!isOpenSocket(socket)) return;
+  socket.send(JSON.stringify(payload));
+}
+
+function resolveChannelId(msg) {
+  if (typeof msg.channelId === 'string' && msg.channelId.trim()) {
+    return msg.channelId.trim();
+  }
+  return DEFAULT_CHANNEL_ID;
+}
+
+function emitChannelsSnapshot(groupId, target = null) {
+  const payload = {
+    type: target ? 'admin_channels_snapshot' : 'channels_snapshot',
+    group_id: groupId,
+    channels: listChannels(groupId),
+  };
+  if (target) {
+    safeSend(target, payload);
+    return;
+  }
+  broadcastToGroup(groupId, payload);
+}
+
+function emitTokenGranted(groupId, channelId, granted) {
+  const holderName = getCurrentHolder(groupId, channelId)?.name || null;
+  broadcastToGroup(groupId, {
+    type: 'ptt_granted',
+    groupId,
+    channelId,
+    userId: granted.user_id,
+    user_id: granted.user_id,
+    name: holderName,
+    granted_at: granted.granted_at,
+    expires_at: granted.expires_at,
+    queue_length: granted.queue_length ?? 0,
+  });
+
+  if (channelId === DEFAULT_CHANNEL_ID) {
+    broadcastToGroup(groupId, {
+      type: 'ptt_start',
+      userId: granted.user_id,
+      user_id: granted.user_id,
+      name: holderName,
+    });
+  }
+}
+
+function emitTokenRelease(groupId, channelId, release) {
+  if (!release?.released) return;
+  broadcastToGroup(groupId, {
+    type: 'ptt_released',
+    groupId,
+    channelId,
+    userId: release.released_user_id,
+    user_id: release.released_user_id,
+    reason: release.reason,
+    queue_length: release.queue_length ?? 0,
+  });
+
+  if (channelId === DEFAULT_CHANNEL_ID) {
+    broadcastToGroup(groupId, {
+      type: 'ptt_end',
+      userId: release.released_user_id,
+      user_id: release.released_user_id,
+    });
+  }
+
+  if (release.next_granted?.granted) {
+    emitTokenGranted(groupId, channelId, release.next_granted);
+  }
+}
+
+function handleTokenTimeout({ groupId, channelId, userId }) {
+  if (!groupId || !channelId || !userId) return;
+  // Notify the timed-out holder first
+  const socket = getRoomSocket(groupId, userId) || userSockets.get(userId);
+  safeSend(socket, {
+    type: 'ptt_timeout',
+    channelId,
+    userId,
+    reason: 'max_hold_duration',
+  });
+  // Broadcast timeout to the channel so everyone knows
+  broadcastToGroup(groupId, {
+    type: 'ptt_timeout',
+    channelId,
+    userId,
+    reason: 'max_hold_duration',
+  });
+  const release = releaseToken({
+    groupId,
+    channelId,
+    userId,
+    force: true,
+    reason: 'token_timeout',
+    onTimeout: handleTokenTimeout,
+  });
+  emitTokenRelease(groupId, channelId, release);
+  emitChannelsSnapshot(groupId);
+}
 
 async function ensureUserAllowed(userId) {
   if (!userId) {
@@ -208,6 +322,7 @@ async function handleMessage(ws, msg) {
         ws.userId = msg.userId;
         ws.groupId = msg.groupId;
         ws.name = msg.name || userRecord.name;
+        ws.channelId = DEFAULT_CHANNEL_ID;
         ws.lastSeenAt = new Date().toISOString();
         lastSeenByUser.set(msg.userId, ws.lastSeenAt);
         userSockets.set(msg.userId, ws);
@@ -220,6 +335,11 @@ async function handleMessage(ws, msg) {
           groupId: msg.groupId,
           members: await getGroupMemberPresence(msg.groupId),
         }));
+        safeSend(ws, {
+          type: 'channels_snapshot',
+          group_id: msg.groupId,
+          channels: listChannels(msg.groupId),
+        });
 
         broadcastToGroup(msg.groupId, {
           type: 'member_joined',
@@ -243,6 +363,165 @@ async function handleMessage(ws, msg) {
         ws.send(JSON.stringify({ type: 'error', message: 'Unable to join room' }));
         ws.close(1011, 'join_failed');
       }
+      break;
+    }
+
+    case 'channels_list': {
+      if (!ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      safeSend(ws, {
+        type: 'channels_snapshot',
+        group_id: ws.groupId,
+        channels: listChannels(ws.groupId),
+      });
+      break;
+    }
+
+    case 'channel_create': {
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      if (!msg.name || typeof msg.name !== 'string' || !msg.name.trim()) {
+        ws.send(JSON.stringify({ type: 'error', message: 'channel name required' }));
+        return;
+      }
+      const channelId = msg.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+      const result = createChannel(ws.groupId, channelId, msg.name.trim());
+      safeSend(ws, {
+        type: result.created ? 'channel_created' : 'error',
+        channel_id: channelId,
+        group_id: ws.groupId,
+        name: msg.name.trim(),
+        reason: result.reason || null,
+      });
+      if (result.created) {
+        broadcastToGroup(ws.groupId, {
+          type: 'channel_created',
+          channel_id: channelId,
+          group_id: ws.groupId,
+          name: msg.name.trim(),
+        });
+        emitChannelsSnapshot(ws.groupId);
+      }
+      break;
+    }
+
+    case 'channel_join': {
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      const joinChannelId = resolveChannelId(msg);
+      const exists = listChannels(ws.groupId).some((channel) => channel.id === joinChannelId);
+      if (!exists) {
+        safeSend(ws, {
+          type: 'error',
+          message: 'channel_not_found',
+          channel_id: joinChannelId,
+        });
+        return;
+      }
+      ws.channelId = joinChannelId;
+      safeSend(ws, {
+        type: 'channel_joined',
+        channel_id: joinChannelId,
+        group_id: ws.groupId,
+        channels: listChannels(ws.groupId),
+      });
+      break;
+    }
+
+    case 'channel_leave': {
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      const leaveChannelId = resolveChannelId(msg);
+      if (leaveChannelId === DEFAULT_CHANNEL_ID) {
+        safeSend(ws, { type: 'error', message: 'cannot leave general channel' });
+        return;
+      }
+      if (isTokenHolder(ws.groupId, leaveChannelId, ws.userId)) {
+        releaseToken({
+          groupId: ws.groupId,
+          channelId: leaveChannelId,
+          userId: ws.userId,
+          force: true,
+          reason: 'left_channel',
+          onTimeout: handleTokenTimeout,
+        });
+      }
+      ws.channelId = DEFAULT_CHANNEL_ID;
+      safeSend(ws, {
+        type: 'channel_left',
+        channel_id: leaveChannelId,
+        group_id: ws.groupId,
+      });
+      emitChannelsSnapshot(ws.groupId);
+      break;
+    }
+
+    case 'channel_switch': {
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      const switchChannelId = resolveChannelId(msg);
+      const switchExists = listChannels(ws.groupId).some((channel) => channel.id === switchChannelId);
+      if (!switchExists) {
+        safeSend(ws, { type: 'error', message: 'channel_not_found', channel_id: switchChannelId });
+        return;
+      }
+      const oldChannelId = ws.channelId || DEFAULT_CHANNEL_ID;
+      if (oldChannelId === switchChannelId) {
+        safeSend(ws, { type: 'channel_joined', channel_id: switchChannelId, group_id: ws.groupId });
+        return;
+      }
+      if (isTokenHolder(ws.groupId, oldChannelId, ws.userId)) {
+        releaseToken({
+          groupId: ws.groupId,
+          channelId: oldChannelId,
+          userId: ws.userId,
+          force: true,
+          reason: 'switched_channel',
+          onTimeout: handleTokenTimeout,
+        });
+      }
+      ws.channelId = switchChannelId;
+      safeSend(ws, {
+        type: 'channel_joined',
+        channel_id: switchChannelId,
+        group_id: ws.groupId,
+        channels: listChannels(ws.groupId),
+      });
+      emitChannelsSnapshot(ws.groupId);
+      break;
+    }
+
+    case 'channel_select': {
+      if (!ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      const selChannelId = resolveChannelId(msg);
+      const selExists = listChannels(ws.groupId).some((channel) => channel.id === selChannelId);
+      if (!selExists) {
+        safeSend(ws, {
+          type: 'error',
+          message: 'channel_not_found',
+          channel_id: selChannelId,
+        });
+        return;
+      }
+      ws.channelId = channelId;
+      safeSend(ws, {
+        type: 'channel_selected',
+        group_id: ws.groupId,
+        channel_id: channelId,
+      });
       break;
     }
 
@@ -336,45 +615,296 @@ async function handleMessage(ws, msg) {
       break;
     }
 
-    case 'ptt_start': {
-      const floorHolder = channelFloor.get(msg.groupId);
-      if (floorHolder && floorHolder !== msg.userId) {
-        ws.send(JSON.stringify({ type: 'ptt_busy', userId: floorHolder }));
+    case 'ptt_request': {
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      const channelId = resolveChannelId(msg);
+      ws.channelId = channelId;
+      const result = requestToken({
+        groupId: ws.groupId,
+        channelId,
+        userId: ws.userId,
+        name: ws.name,
+        onTimeout: handleTokenTimeout,
+      });
+
+      if (result.denied) {
+        safeSend(ws, {
+          type: 'ptt_denied',
+          channel_id: channelId,
+          reason: result.reason,
+        });
+        if (result.reason === 'muted') {
+          safeSend(ws, {
+            type: 'ptt_force_release',
+            channel_id: channelId,
+            reason: 'admin_muted',
+          });
+        }
         break;
       }
-      channelFloor.set(msg.groupId, msg.userId);
-      broadcastToGroup(msg.groupId, {
-        type: 'ptt_start',
-        userId: msg.userId,
+
+      if (result.granted) {
+        emitTokenGranted(ws.groupId, channelId, result);
+      } else if (result.queued) {
+        safeSend(ws, {
+          type: 'ptt_queued',
+          groupId: ws.groupId,
+          channelId,
+          userId: ws.userId,
+          position: result.position,
+          queue_length: result.queue_length ?? result.position,
+        });
+      }
+
+      emitChannelsSnapshot(ws.groupId);
+      break;
+    }
+
+    case 'ptt_start': {
+      // Backward compatible: old PTT clients that don't know about channels
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      const channelId = DEFAULT_CHANNEL_ID;
+      ws.channelId = channelId;
+      const result = requestToken({
+        groupId: ws.groupId,
+        channelId,
+        userId: ws.userId,
         name: ws.name,
-      }, ws);
+        onTimeout: handleTokenTimeout,
+      });
+
+      if (result.denied) {
+        safeSend(ws, { type: 'ptt_busy', userId: ws.userId });
+        break;
+      }
+
+      if (result.granted) {
+        safeSend(ws, { type: 'ptt_granted', channelId: DEFAULT_CHANNEL_ID, userId: ws.userId });
+        broadcastToGroup(ws.groupId, { type: 'ptt_start', userId: ws.userId, name: ws.name }, ws);
+      } else if (result.queued) {
+        // Old clients: respond with ptt_busy so they don't leave mic on
+        safeSend(ws, { type: 'ptt_busy', userId: ws.userId });
+      }
+      break;
+    }
+
+    case 'ptt_release': {
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      const channelId = resolveChannelId(msg);
+      const release = releaseToken({
+        groupId: ws.groupId,
+        channelId,
+        userId: ws.userId,
+        force: false,
+        reason: 'released',
+        onTimeout: handleTokenTimeout,
+      });
+      emitTokenRelease(ws.groupId, channelId, release);
+      emitChannelsSnapshot(ws.groupId);
       break;
     }
 
     case 'ptt_end': {
-      if (channelFloor.get(msg.groupId) === msg.userId) {
-        channelFloor.delete(msg.groupId);
+      // Backward compatible: old PTT release
+      if (!ws.userId || !ws.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
       }
-      broadcastToGroup(msg.groupId, {
-        type: 'ptt_end',
-        userId: msg.userId,
-      }, ws);
+      const release = releaseToken({
+        groupId: ws.groupId,
+        channelId: DEFAULT_CHANNEL_ID,
+        userId: ws.userId,
+        force: false,
+        reason: 'released',
+        onTimeout: handleTokenTimeout,
+      });
+      if (release.released) {
+        broadcastToGroup(ws.groupId, { type: 'ptt_end', userId: ws.userId }, ws);
+        if (release.next_granted?.granted) {
+          broadcastToGroup(ws.groupId, { type: 'ptt_start', userId: release.next_granted.user_id, name: release.next_granted.name || 'Teammate' });
+        }
+      }
+      emitChannelsSnapshot(ws.groupId);
       break;
     }
 
     case 'audio_chunk': {
-      // Only the floor holder may send audio
-      if (channelFloor.get(msg.groupId) !== msg.userId) {
+      const channelId = resolveChannelId(msg);
+      // Only the channel token holder may send audio.
+      if (!isTokenHolder(ws.groupId, channelId, ws.userId)) {
         break;
       }
-      const nextSeq = (speakerSeq.get(msg.userId) || 0) + 1;
-      speakerSeq.set(msg.userId, nextSeq);
-      broadcastToGroup(msg.groupId, {
+      const nextSeq = (speakerSeq.get(ws.userId) || 0) + 1;
+      speakerSeq.set(ws.userId, nextSeq);
+      broadcastToGroup(ws.groupId, {
         type: 'audio_chunk',
-        userId: msg.userId,
+        channelId,
+        userId: ws.userId,
+        user_id: ws.userId,
         data: msg.data,
         seqNum: nextSeq,
       }, ws);
+      break;
+    }
+
+    case 'admin_list_channels': {
+      if (!ws.adminRoom) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      if (!msg.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'groupId required' }));
+        return;
+      }
+      emitChannelsSnapshot(msg.groupId, ws);
+      break;
+    }
+
+    case 'admin_mute_user': {
+      if (!ws.adminRoom) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      if (!msg.groupId || !msg.userId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'groupId and userId required' }));
+        return;
+      }
+      const channelId = resolveChannelId(msg);
+      const muted = msg.muted !== false; // true by default for backward compat
+      if (muted) {
+        const result = muteUser(msg.groupId, channelId, msg.userId, handleTokenTimeout);
+        if (!result.muted) {
+          safeSend(ws, {
+            type: 'admin_user_muted',
+            group_id: msg.groupId,
+            channel_id: channelId,
+            user_id: msg.userId,
+            muted: false,
+            reason: result.reason || 'failed',
+          });
+          return;
+        }
+        safeSend(ws, {
+          type: 'admin_user_muted',
+          group_id: msg.groupId,
+          channel_id: channelId,
+          user_id: msg.userId,
+          muted: true,
+        });
+        broadcastToGroup(msg.groupId, {
+          type: 'user_muted',
+          groupId: msg.groupId,
+          channelId,
+          userId: msg.userId,
+          user_id: msg.userId,
+          reason: 'admin',
+        });
+        const targetSocket = getRoomSocket(msg.groupId, msg.userId) || userSockets.get(msg.userId);
+        safeSend(targetSocket, {
+          type: 'user_muted',
+          channelId,
+          reason: 'admin',
+        });
+        if (result.rotation?.released) {
+          emitTokenRelease(msg.groupId, channelId, result.rotation);
+        }
+      } else {
+        // Unmute
+        const unmuteResult = unmuteUser(msg.groupId, channelId, msg.userId);
+        safeSend(ws, {
+          type: 'admin_user_muted',
+          group_id: msg.groupId,
+          channel_id: channelId,
+          user_id: msg.userId,
+          muted: false,
+          unmuted: unmuteResult?.unmuted ?? true,
+        });
+        broadcastToGroup(msg.groupId, {
+          type: 'user_unmuted',
+          groupId: msg.groupId,
+          channelId,
+          userId: msg.userId,
+          user_id: msg.userId,
+        });
+        const unmuteTarget = getRoomSocket(msg.groupId, msg.userId) || userSockets.get(msg.userId);
+        safeSend(unmuteTarget, {
+          type: 'user_unmuted',
+          channelId,
+        });
+      }
+      emitChannelsSnapshot(msg.groupId);
+      break;
+    }
+
+    case 'admin_force_rotate': {
+      if (!ws.adminRoom) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      if (!msg.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'groupId required' }));
+        return;
+      }
+      const channelId = resolveChannelId(msg);
+      const result = forceRotate(msg.groupId, channelId, handleTokenTimeout);
+      safeSend(ws, {
+        type: 'admin_force_rotated',
+        group_id: msg.groupId,
+        channel_id: channelId,
+        rotated: result.rotated,
+      });
+      if (result.rotation?.released) {
+        emitTokenRelease(msg.groupId, channelId, result.rotation);
+      }
+      emitChannelsSnapshot(msg.groupId);
+      break;
+    }
+
+    case 'admin_delete_channel': {
+      if (!ws.adminRoom) {
+        ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
+        return;
+      }
+      if (!msg.groupId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'groupId required' }));
+        return;
+      }
+      const channelId = resolveChannelId(msg);
+      const holder = getCurrentHolder(msg.groupId, channelId);
+      const result = deleteChannel(msg.groupId, channelId);
+      safeSend(ws, {
+        type: 'admin_channel_deleted',
+        group_id: msg.groupId,
+        channel_id: channelId,
+        deleted: result.deleted,
+        reason: result.reason || null,
+      });
+      if (!result.deleted) {
+        break;
+      }
+      if (holder?.userId) {
+        const holderSocket = getRoomSocket(msg.groupId, holder.userId) || userSockets.get(holder.userId);
+        safeSend(holderSocket, {
+          type: 'ptt_force_release',
+          channel_id: channelId,
+          reason: 'channel_deleted',
+        });
+      }
+      broadcastToGroup(msg.groupId, {
+        type: 'channel_deleted',
+        groupId: msg.groupId,
+        channelId,
+      });
+      emitChannelsSnapshot(msg.groupId);
       break;
     }
 
@@ -532,13 +1062,12 @@ function handleDisconnect(ws) {
       userSockets.delete(ws.userId);
     }
     speakerSeq.delete(ws.userId);
-    // Release channel floor if this user held it
-    if (ws.groupId && channelFloor.get(ws.groupId) === ws.userId) {
-      channelFloor.delete(ws.groupId);
-      broadcastToGroup(ws.groupId, {
-        type: 'ptt_end',
-        userId: ws.userId,
+    if (ws.groupId) {
+      const releases = releaseUserFromAll(ws.groupId, ws.userId, handleTokenTimeout);
+      releases.forEach((release) => {
+        emitTokenRelease(ws.groupId, release.channel_id || DEFAULT_CHANNEL_ID, release);
       });
+      emitChannelsSnapshot(ws.groupId);
     }
   }
   if (ws.groupId && rooms.has(ws.groupId)) {
