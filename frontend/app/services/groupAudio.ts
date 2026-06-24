@@ -9,6 +9,7 @@ import {
 
 export type SignalTier = 'excellent' | 'good' | 'fair' | 'poor';
 export type AudioBitrateBps = 6000 | 12000 | 18000 | 24000;
+export type GroupAudioMode = 'ptt' | 'always_on' | 'fallback';
 
 export type GroupAudioSignal =
   | { kind: 'offer'; sdp: string }
@@ -31,6 +32,9 @@ export interface GroupAudioCallbacks {
   onRemoteStream?: (peerUserId: string, stream: MediaStream) => void;
   onPeerState?: (peerUserId: string, state: string) => void;
   onSpeakingTrack?: (peerUserId: string, enabled: boolean) => void;
+  onModeChanged?: (mode: GroupAudioMode) => void;
+  onFallbackActivated?: (reason: 'low_signal' | 'peer_disconnected') => void;
+  onFallbackRecovered?: () => void;
   onError?: (peerUserId: string | null, error: Error) => void;
 }
 
@@ -179,6 +183,10 @@ export class GroupAudioManager {
 
   private bitrate: AudioBitrateBps;
 
+  private mode: GroupAudioMode = 'ptt';
+
+  private fallbackActive = false;
+
   private disposed = false;
 
   constructor(options: GroupAudioManagerOptions) {
@@ -315,6 +323,13 @@ export class GroupAudioManager {
   async setSignalTier(tier: SignalTier): Promise<void> {
     this.signalTier = normalizeSignalTier(tier);
     this.bitrate = bitrateForSignalTier(this.signalTier);
+    if (this.mode === 'always_on') {
+      if (this.signalTier === 'poor') {
+        this.setFallbackActive(true, 'low_signal');
+      } else if (this.fallbackActive) {
+        this.setFallbackActive(false);
+      }
+    }
     const peers = Array.from(this.peers.values());
     await Promise.all(peers.map(async (peer) => {
       try {
@@ -327,6 +342,18 @@ export class GroupAudioManager {
 
   getBitrate(): AudioBitrateBps {
     return this.bitrate;
+  }
+
+  getMode(): GroupAudioMode {
+    return this.mode;
+  }
+
+  async setMode(mode: GroupAudioMode): Promise<void> {
+    this.mode = mode;
+    this.callbacks.onModeChanged?.(mode);
+
+    const shouldEnableMic = mode === 'always_on' && !this.fallbackActive;
+    await this.setMicEnabled(shouldEnableMic);
   }
 
   dispose(): void {
@@ -387,6 +414,13 @@ export class GroupAudioManager {
     (pc as any).onconnectionstatechange = () => {
       const state = String((pc as any).connectionState || 'unknown');
       this.callbacks.onPeerState?.(peer.userId, state);
+      if (this.mode === 'always_on') {
+        if (state === 'failed' || state === 'disconnected') {
+          this.setFallbackActive(true, 'peer_disconnected');
+        } else if (state === 'connected' && this.signalTier !== 'poor') {
+          this.setFallbackActive(false);
+        }
+      }
     };
 
     if (this.localStream) {
@@ -422,5 +456,21 @@ export class GroupAudioManager {
   private emitError(peerUserId: string | null, rawError: unknown): void {
     const error = rawError instanceof Error ? rawError : new Error(String(rawError));
     this.callbacks.onError?.(peerUserId, error);
+  }
+
+  private setFallbackActive(active: boolean, reason?: 'low_signal' | 'peer_disconnected'): void {
+    if (this.fallbackActive === active) return;
+    this.fallbackActive = active;
+    if (active) {
+      this.callbacks.onFallbackActivated?.(reason || 'low_signal');
+      this.setMicEnabled(false).catch((error) => this.emitError(null, error));
+      this.callbacks.onModeChanged?.('fallback');
+      return;
+    }
+    this.callbacks.onFallbackRecovered?.();
+    if (this.mode === 'always_on') {
+      this.setMicEnabled(true).catch((error) => this.emitError(null, error));
+      this.callbacks.onModeChanged?.('always_on');
+    }
   }
 }
