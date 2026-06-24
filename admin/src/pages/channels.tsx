@@ -47,7 +47,7 @@ export default function ChannelsPage() {
 
   const requestChannels = useCallback((groupId: string) => {
     if (!groupId) return;
-    wsRef.current?.send(JSON.stringify({ type: 'admin_channels_list', groupId }));
+    wsRef.current?.send(JSON.stringify({ type: 'admin_list_channels', groupId }));
   }, []);
 
   const sendAdminAction = useCallback((payload: Record<string, any>) => {
@@ -220,7 +220,7 @@ export default function ChannelsPage() {
                       <button
                         onClick={() =>
                           sendAdminAction({
-                            type: 'admin_channel_mute',
+                            type: 'admin_mute_user',
                             groupId: selectedGroupId,
                             channelId: channel.id,
                             userId: channel.token_holder?.user_id,
@@ -249,7 +249,7 @@ export default function ChannelsPage() {
                           <button
                             onClick={() =>
                               sendAdminAction({
-                                type: 'admin_channel_mute',
+                                type: 'admin_mute_user',
                                 groupId: selectedGroupId,
                                 channelId: channel.id,
                                 userId: entry.user_id,
@@ -274,7 +274,7 @@ export default function ChannelsPage() {
                     <button
                       onClick={() =>
                         sendAdminAction({
-                          type: 'admin_channel_rotate',
+                          type: 'admin_force_rotate',
                           groupId: selectedGroupId,
                           channelId: channel.id,
                         })
@@ -286,7 +286,7 @@ export default function ChannelsPage() {
                     <button
                       onClick={() =>
                         sendAdminAction({
-                          type: 'admin_channel_delete',
+                          type: 'admin_delete_channel',
                           groupId: selectedGroupId,
                           channelId: channel.id,
                         })
