@@ -31,6 +31,7 @@ const SettingsScreen = () => {
   const [displayName, setDisplayName] = useState('');
   const [editedName, setEditedName] = useState('');
   const [alwaysOn, setAlwaysOn] = useState(false);
+  const [intercomAlwaysOn, setIntercomAlwaysOn] = useState(false);
   const [saving, setSaving] = useState(false);
   const [leaving, setLeaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -46,11 +47,12 @@ const SettingsScreen = () => {
   useEffect(() => {
     const loadSettings = async () => {
       try {
-        const [[, name], [, alwaysOnVal]] = await AsyncStorage.multiGet(['displayName', 'alwaysOn']);
+        const [[, name], [, alwaysOnVal], [, intercomAlwaysOnVal]] = await AsyncStorage.multiGet(['displayName', 'alwaysOn', 'intercomAlwaysOn']);
         setDisplayName(name || '');
         setEditedName(name || '');
         const running = await isBackgroundLocationRunning();
         setAlwaysOn(running);
+        setIntercomAlwaysOn(intercomAlwaysOnVal === 'true');
         if (alwaysOnVal === 'true' && !running) {
           await AsyncStorage.setItem('alwaysOn', 'false');
         }
@@ -147,6 +149,11 @@ const SettingsScreen = () => {
       setAlwaysOn(false);
       await AsyncStorage.setItem('alwaysOn', 'false');
     }
+  }, []);
+
+  const handleToggleIntercomAlwaysOn = useCallback(async (value: boolean) => {
+    setIntercomAlwaysOn(value);
+    await AsyncStorage.setItem('intercomAlwaysOn', value ? 'true' : 'false');
   }, []);
 
   const handleLeaveGroup = useCallback(() => {
@@ -309,6 +316,20 @@ const SettingsScreen = () => {
             onValueChange={handleToggleAlwaysOn}
             trackColor={{ false: '#26445f', true: '#1e88e5' }}
             thumbColor={alwaysOn ? '#64ffda' : '#9fb4cc'}
+          />
+        </View>
+        <View style={styles.row}>
+          <View>
+            <Text style={styles.rowLabel}>Intercom Always-On</Text>
+            <Text style={styles.rowSub}>
+              {intercomAlwaysOn ? 'Hands-free voice when signal is stable' : 'Push-to-talk intercom mode'}
+            </Text>
+          </View>
+          <Switch
+            value={intercomAlwaysOn}
+            onValueChange={handleToggleIntercomAlwaysOn}
+            trackColor={{ false: '#26445f', true: '#1e88e5' }}
+            thumbColor={intercomAlwaysOn ? '#64ffda' : '#9fb4cc'}
           />
         </View>
       </View>

@@ -44,11 +44,21 @@ export interface WebRtcSignalMessage {
   signal: any;
 }
 
+export type SignalTier = 'excellent' | 'good' | 'fair' | 'poor';
+
+export interface SignalQuality {
+  tier: SignalTier;
+  rttMs: number | null;
+  reconnectCount: number;
+  lastPongAt: number | null;
+}
+
 const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:8100';
 const WS_URL = API_URL.replace('http', 'ws');
 
 const MIN_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
+const PING_INTERVAL_MS = 12000;
 
 class FlowWebSocket {
   private socket: WebSocket | null = null;
@@ -57,6 +67,15 @@ class FlowWebSocket {
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private reconnectDelay = MIN_RECONNECT_DELAY;
   private manuallyDisconnected = false;
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private reconnectCount = 0;
+  private lastPongAt: number | null = null;
+  private signalQuality: SignalQuality = {
+    tier: 'poor',
+    rttMs: null,
+    reconnectCount: 0,
+    lastPongAt: null,
+  };
 
   connect(userId: string, groupId: string, name: string) {
     if (!userId || !groupId) return;
@@ -65,6 +84,7 @@ class FlowWebSocket {
     // so the stale async onclose cannot fire a reconnect after we open a new socket (#27, #29)
     this._clearReconnectTimer();
     this.reconnectDelay = MIN_RECONNECT_DELAY;
+    this.reconnectCount = 0;
 
     if (this.socket) {
       this.socket.onclose = null;   // detach old handler — no stale reconnect
@@ -89,13 +109,22 @@ class FlowWebSocket {
 
     this.socket.onopen = () => {
       this.reconnectDelay = MIN_RECONNECT_DELAY;
+      this.reconnectCount = 0;
       this.emit('status', { state: 'connected' });
       this.send({ type: 'join' });
+      this._startPingLoop();
+      this._emitSignalQuality(this.signalQuality.rttMs);
     };
 
     this.socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        if (data?.type === 'server_pong') {
+          const ts = Number(data?.ts);
+          const rttMs = Number.isFinite(ts) ? Math.max(0, Date.now() - ts) : null;
+          this.lastPongAt = Date.now();
+          this._emitSignalQuality(rttMs);
+        }
         this.emit('message', data);
         if (typeof data?.type === 'string') {
           this.emit(data.type, data);
@@ -112,8 +141,11 @@ class FlowWebSocket {
 
     this.socket.onclose = () => {
       const wasManual = this.manuallyDisconnected;
+      this._clearPingLoop();
       this.emit('status', { state: 'closed' });
       if (!wasManual && this.identity.userId && this.identity.groupId) {
+        this.reconnectCount += 1;
+        this._emitSignalQuality(this.signalQuality.rttMs);
         // Add jitter (±20%) to prevent thundering-herd reconnects (#29)
         const jitter = 0.8 + Math.random() * 0.4;
         const delay = Math.round(this.reconnectDelay * jitter);
@@ -130,6 +162,49 @@ class FlowWebSocket {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
     }
+  }
+
+  private _startPingLoop() {
+    this._clearPingLoop();
+    this.pingInterval = setInterval(() => {
+      if (this.socket?.readyState === WebSocket.OPEN) {
+        this.sendPing(Date.now());
+      }
+    }, PING_INTERVAL_MS);
+  }
+
+  private _clearPingLoop() {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+  }
+
+  private _deriveSignalTier(rttMs: number | null): SignalTier {
+    if (this.socket?.readyState !== WebSocket.OPEN) {
+      return 'poor';
+    }
+    if (this.reconnectCount >= 3) {
+      return 'poor';
+    }
+    if (rttMs == null) {
+      return this.reconnectCount === 0 ? 'good' : 'fair';
+    }
+    if (rttMs <= 140 && this.reconnectCount === 0) return 'excellent';
+    if (rttMs <= 280 && this.reconnectCount <= 1) return 'good';
+    if (rttMs <= 600) return 'fair';
+    return 'poor';
+  }
+
+  private _emitSignalQuality(rttMs: number | null) {
+    const quality: SignalQuality = {
+      tier: this._deriveSignalTier(rttMs),
+      rttMs,
+      reconnectCount: this.reconnectCount,
+      lastPongAt: this.lastPongAt,
+    };
+    this.signalQuality = quality;
+    this.emit('signal_quality', quality);
   }
 
   send(payload: Record<string, any>) {
@@ -161,10 +236,19 @@ class FlowWebSocket {
   disconnect() {
     this.manuallyDisconnected = true;
     this._clearReconnectTimer();
+    this._clearPingLoop();
     if (this.socket) {
       this.socket.close();
       this.socket = null;
     }
+    this.reconnectCount = 0;
+    this.lastPongAt = null;
+    this.signalQuality = {
+      tier: 'poor',
+      rttMs: null,
+      reconnectCount: 0,
+      lastPongAt: null,
+    };
     this.identity = { userId: '', groupId: '', name: '' };
   }
 
@@ -235,6 +319,12 @@ class FlowWebSocket {
 
   sendPing(ts = Date.now()) {
     this.send({ type: 'client_ping', ts });
+  }
+
+  onSignalQuality(handler: (quality: SignalQuality) => void): () => void {
+    return this.on('signal_quality', (payload: any) => {
+      handler(payload as SignalQuality);
+    });
   }
 
   on(event: string, listener: Listener): () => void {

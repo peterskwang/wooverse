@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, FlatList, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Animated, AppState, AppStateStatus, FlatList, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useFocusEffect } from 'expo-router';
 
-import wsClient, { MemberSnapshotMessage, PresenceMessage, WebRtcSignalMessage } from '../services/ws';
-import { GroupAudioManager } from '../services/groupAudio';
+import wsClient, { MemberSnapshotMessage, PresenceMessage, SignalQuality, WebRtcSignalMessage } from '../services/ws';
+import { GroupAudioManager, GroupAudioMode } from '../services/groupAudio';
 
 interface Identity {
   userId: string;
@@ -17,7 +18,7 @@ interface MemberState {
   isTalking: boolean;
 }
 
-const STORAGE_KEYS = ['userId', 'groupId', 'displayName'] as const;
+const STORAGE_KEYS = ['userId', 'groupId', 'displayName', 'intercomAlwaysOn'] as const;
 
 const IntercomScreen = () => {
   const [identity, setIdentity] = useState<Identity>({ userId: '', groupId: '', name: '' });
@@ -26,6 +27,15 @@ const IntercomScreen = () => {
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error' | 'closed'>(wsClient.getState());
   const [isTransmitting, setIsTransmitting] = useState(false);
   const [channelBusy, setChannelBusy] = useState(false);
+  const [intercomAlwaysOn, setIntercomAlwaysOn] = useState(false);
+  const [groupAudioMode, setGroupAudioMode] = useState<GroupAudioMode>('ptt');
+  const [fallbackReason, setFallbackReason] = useState<'low_signal' | 'peer_disconnected' | null>(null);
+  const [signalQuality, setSignalQuality] = useState<SignalQuality>({
+    tier: 'poor',
+    rttMs: null,
+    reconnectCount: 0,
+    lastPongAt: null,
+  });
   const [permissionError, setPermissionError] = useState<string | null>(null);
 
   const groupAudioRef = useRef<GroupAudioManager | null>(null);
@@ -76,6 +86,9 @@ const IntercomScreen = () => {
       },
       callbacks: {
         sendSignal: (targetUserId, signal) => wsClient.sendWebRtcSignal(targetUserId, signal),
+        onModeChanged: (mode) => setGroupAudioMode(mode),
+        onFallbackActivated: (reason) => setFallbackReason(reason),
+        onFallbackRecovered: () => setFallbackReason(null),
         onError: (_peerUserId, error) => {
           console.warn('[intercom] group audio error:', error.message);
         },
@@ -84,6 +97,7 @@ const IntercomScreen = () => {
 
     try {
       await manager.start();
+      await manager.setMode(intercomAlwaysOn ? 'always_on' : 'ptt');
       groupAudioRef.current = manager;
       setPermissionError(null);
     } catch (error) {
@@ -91,7 +105,7 @@ const IntercomScreen = () => {
       const message = error instanceof Error ? error.message : String(error);
       setPermissionError(message || 'Unable to access microphone');
     }
-  }, []);
+  }, [intercomAlwaysOn]);
 
   const teardownGroupAudio = useCallback(() => {
     Object.values(recoveryOfferTimersRef.current).forEach((timer) => clearTimeout(timer));
@@ -103,6 +117,7 @@ const IntercomScreen = () => {
   }, []);
 
   const startTalking = useCallback(async () => {
+    if (intercomAlwaysOn && !fallbackReason) return;
     const manager = groupAudioRef.current;
     if (!manager || !groupId || connectionStatus !== 'connected' || isTransmitting || channelBusy) return;
 
@@ -131,7 +146,7 @@ const IntercomScreen = () => {
       const message = error instanceof Error ? error.message : String(error);
       setPermissionError(message || 'Unable to access microphone');
     }
-  }, [channelBusy, connectionStatus, displayName, groupId, isTransmitting, userId]);
+  }, [channelBusy, connectionStatus, displayName, fallbackReason, groupId, intercomAlwaysOn, isTransmitting, userId]);
 
   const stopTalking = useCallback(async () => {
     const manager = groupAudioRef.current;
@@ -326,6 +341,7 @@ const IntercomScreen = () => {
           groupId: (values.groupId as string) || '',
           name: (values.displayName as string) || '',
         });
+        setIntercomAlwaysOn(values.intercomAlwaysOn === 'true');
       } catch (error) {
         console.warn('Failed to load intercom identity', error);
       }
@@ -337,6 +353,22 @@ const IntercomScreen = () => {
       mounted = false;
     };
   }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      AsyncStorage.getItem('intercomAlwaysOn')
+        .then((value) => {
+          if (active) {
+            setIntercomAlwaysOn(value === 'true');
+          }
+        })
+        .catch(() => null);
+      return () => {
+        active = false;
+      };
+    }, [])
+  );
 
   useEffect(() => {
     if (!userId || !groupId) return;
@@ -387,6 +419,55 @@ const IntercomScreen = () => {
   }, [handleMessage]);
 
   useEffect(() => {
+    const unsubscribe = wsClient.onSignalQuality((quality) => {
+      setSignalQuality(quality);
+      groupAudioRef.current?.setSignalTier(quality.tier).catch((error) => {
+        console.warn('[intercom] setSignalTier failed:', error);
+      });
+    });
+    return () => {
+      unsubscribe?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (intercomAlwaysOn && (isTransmitting || pendingPttRef.current)) {
+      stopTalking().catch(() => null);
+    }
+    const manager = groupAudioRef.current;
+    if (!manager) return;
+
+    const nextMode: GroupAudioMode = intercomAlwaysOn && !fallbackReason ? 'always_on' : 'ptt';
+    manager.setMode(nextMode).catch((error) => {
+      console.warn('[intercom] setMode failed:', error);
+    });
+  }, [fallbackReason, intercomAlwaysOn, isTransmitting, stopTalking]);
+
+  useEffect(() => {
+    const handleAppState = (nextState: AppStateStatus) => {
+      const manager = groupAudioRef.current;
+      if (!manager) return;
+
+      if (nextState !== 'active') {
+        if (isTransmitting || pendingPttRef.current) {
+          stopTalking().catch(() => null);
+        }
+        manager.setMicEnabled(false).catch(() => null);
+        return;
+      }
+
+      if (manager.getMode() === 'always_on') {
+        manager.setMicEnabled(true).catch(() => null);
+      }
+    };
+
+    const subscription = AppState.addEventListener('change', handleAppState);
+    return () => {
+      subscription.remove();
+    };
+  }, [isTransmitting, stopTalking]);
+
+  useEffect(() => {
     let animation: Animated.CompositeAnimation | null = null;
     if (activeSpeaker) {
       animation = Animated.loop(
@@ -405,7 +486,8 @@ const IntercomScreen = () => {
     };
   }, [activeSpeaker, pulseScale]);
 
-  const buttonDisabled = !groupId || connectionStatus !== 'connected';
+  const alwaysOnActive = intercomAlwaysOn && !fallbackReason;
+  const buttonDisabled = !groupId || connectionStatus !== 'connected' || alwaysOnActive;
 
   const memberList = useMemo(() => {
     return Object.values(members).sort((a, b) => {
@@ -417,9 +499,19 @@ const IntercomScreen = () => {
 
   const statusText = groupId
     ? connectionStatus === 'connected'
-      ? 'Connected to group intercom'
+      ? alwaysOnActive
+        ? 'Always-on intercom active'
+        : 'Connected to group intercom'
       : 'Connecting to intercom...'
     : 'Join a group to enable intercom';
+
+  const signalColor = signalQuality.tier === 'excellent'
+    ? '#4caf50'
+    : signalQuality.tier === 'good'
+      ? '#8bc34a'
+      : signalQuality.tier === 'fair'
+        ? '#ffb300'
+        : '#ff7043';
 
   return (
     <View style={styles.container}>
@@ -469,10 +561,28 @@ const IntercomScreen = () => {
       </ScrollView>
 
       <View style={styles.controls}>
+        {fallbackReason ? (
+          <View style={styles.fallbackBanner}>
+            <Text style={styles.fallbackText}>
+              Always-on fallback: {fallbackReason === 'low_signal' ? 'signal is weak' : 'peer link unstable'}.
+            </Text>
+          </View>
+        ) : null}
+        <View style={styles.signalRow}>
+          <View style={[styles.signalDot, { backgroundColor: signalColor }]} />
+          <Text style={styles.signalText}>
+            Signal {signalQuality.tier.toUpperCase()}
+            {signalQuality.rttMs != null ? ` · ${Math.round(signalQuality.rttMs)}ms` : ''}
+            {signalQuality.reconnectCount > 0 ? ` · R${signalQuality.reconnectCount}` : ''}
+          </Text>
+        </View>
         {channelBusy ? (
           <Text style={styles.busyText}>Channel busy — someone else is talking</Text>
         ) : (
-          <Text style={styles.status}>{statusText}</Text>
+          <Text style={styles.status}>
+            {statusText}
+            {groupAudioMode === 'fallback' ? ' (PTT fallback)' : ''}
+          </Text>
         )}
         <Pressable
           onPressIn={startTalking}
@@ -484,7 +594,9 @@ const IntercomScreen = () => {
             buttonDisabled && styles.pttButtonDisabled,
           ]}
         >
-          <Text style={styles.pttLabel}>{isTransmitting ? 'RELEASE TO SEND' : 'HOLD TO TALK'}</Text>
+          <Text style={styles.pttLabel}>
+            {alwaysOnActive ? 'ALWAYS-ON ENABLED' : isTransmitting ? 'RELEASE TO SEND' : 'HOLD TO TALK'}
+          </Text>
         </Pressable>
         {permissionError ? <Text style={styles.errorText}>{permissionError}</Text> : null}
       </View>
@@ -607,6 +719,34 @@ const styles = StyleSheet.create({
     backgroundColor: '#06121f',
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: '#1e3a5f',
+  },
+  fallbackBanner: {
+    backgroundColor: '#3f2a18',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#ff9800',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  fallbackText: {
+    color: '#ffd180',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  signalRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  signalDot: {
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+  },
+  signalText: {
+    color: '#9fb4cc',
+    fontSize: 12,
+    fontWeight: '600',
   },
   status: {
     color: '#9fb4cc',
