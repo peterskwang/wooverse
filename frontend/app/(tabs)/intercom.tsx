@@ -18,6 +18,16 @@ interface MemberState {
   isTalking: boolean;
 }
 
+interface ChannelState {
+  id: string;
+  name?: string;
+  queue_length?: number;
+  token_holder?: {
+    user_id?: string;
+    name?: string;
+  } | null;
+}
+
 const STORAGE_KEYS = ['userId', 'groupId', 'displayName', 'intercomAlwaysOn'] as const;
 const RECENT_RECONNECT_BADGE_MS = 15_000;
 
@@ -28,7 +38,12 @@ const IntercomScreen = () => {
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error' | 'closed'>(wsClient.getState());
   const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
   const [isTransmitting, setIsTransmitting] = useState(false);
+  const [isRequestingToken, setIsRequestingToken] = useState(false);
   const [channelBusy, setChannelBusy] = useState(false);
+  const [selectedChannelId, setSelectedChannelId] = useState('general');
+  const [channels, setChannels] = useState<ChannelState[]>([{ id: 'general', name: 'General', queue_length: 0 }]);
+  const [queuePosition, setQueuePosition] = useState<number | null>(null);
+  const [selectedQueueLength, setSelectedQueueLength] = useState(0);
   const [intercomAlwaysOn, setIntercomAlwaysOn] = useState(false);
   const [groupAudioMode, setGroupAudioMode] = useState<GroupAudioMode>('ptt');
   const [fallbackReason, setFallbackReason] = useState<'low_signal' | 'peer_disconnected' | null>(null);
@@ -42,6 +57,7 @@ const IntercomScreen = () => {
 
   const groupAudioRef = useRef<GroupAudioManager | null>(null);
   const pendingPttRef = useRef(false);
+  const talkIntentRef = useRef(false);
   const recoveryOfferTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const reconnectBadgeUntilRef = useRef(0);
   const pulseScale = useRef(new Animated.Value(1)).current;
@@ -59,6 +75,12 @@ const IntercomScreen = () => {
   const memberIdFromMessage = useCallback((message: any): string | null => {
     const candidate = message?.userId ?? message?.user_id ?? message?.from_user_id;
     return typeof candidate === 'string' && candidate.length > 0 ? candidate : null;
+  }, []);
+
+  const channelIdFromMessage = useCallback((message: any): string => {
+    const candidate = message?.channelId ?? message?.channel_id;
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate;
+    return 'general';
   }, []);
 
   const upsertMemberFromPresence = useCallback((message: any, isTalking?: boolean) => {
@@ -125,42 +147,25 @@ const IntercomScreen = () => {
     if (!manager || !groupId || connectionStatus !== 'connected' || isTransmitting || channelBusy) return;
 
     setPermissionError(null);
+    talkIntentRef.current = true;
     pendingPttRef.current = true;
-    wsClient.send({ type: 'ptt_start', mode: 'ptt' });
-
-    try {
-      await manager.setMicEnabled(true);
-      setIsTransmitting(true);
-      if (userId) {
-        setMembers((prev) => ({
-          ...prev,
-          [userId]: {
-            id: userId,
-            name: displayName || prev[userId]?.name || 'You',
-            isTalking: true,
-          },
-        }));
-        setActiveSpeaker({ id: userId, name: displayName || 'You', isTalking: true });
-      }
-    } catch (error) {
-      pendingPttRef.current = false;
-      await manager.setMicEnabled(false).catch(() => null);
-      wsClient.send({ type: 'ptt_end' });
-      const message = error instanceof Error ? error.message : String(error);
-      setPermissionError(message || 'Unable to access microphone');
-    }
-  }, [channelBusy, connectionStatus, displayName, fallbackReason, groupId, intercomAlwaysOn, isTransmitting, userId]);
+    setIsRequestingToken(true);
+    wsClient.send({ type: 'ptt_request', channelId: selectedChannelId, mode: 'ptt' });
+  }, [channelBusy, connectionStatus, fallbackReason, groupId, intercomAlwaysOn, isTransmitting, selectedChannelId]);
 
   const stopTalking = useCallback(async () => {
     const manager = groupAudioRef.current;
     if (!manager && !isTransmitting && !pendingPttRef.current) return;
 
+    talkIntentRef.current = false;
     pendingPttRef.current = false;
+    setIsRequestingToken(false);
     if (manager) {
       await manager.setMicEnabled(false).catch(() => null);
     }
     setIsTransmitting(false);
-    wsClient.send({ type: 'ptt_end' });
+    wsClient.send({ type: 'ptt_release', channelId: selectedChannelId });
+    setQueuePosition(null);
 
     if (userId) {
       setMembers((prev) => {
@@ -175,7 +180,7 @@ const IntercomScreen = () => {
       });
       setActiveSpeaker((current) => (current && current.id === userId ? null : current));
     }
-  }, [isTransmitting, userId]);
+  }, [isTransmitting, selectedChannelId, userId]);
 
   const handleMemberSnapshot = useCallback((message: MemberSnapshotMessage) => {
     const manager = groupAudioRef.current;
@@ -277,9 +282,77 @@ const IntercomScreen = () => {
       case 'webrtc_signal':
         handleWebRtcSignal(message as WebRtcSignalMessage);
         break;
+      case 'channels_snapshot': {
+        const nextChannels = Array.isArray(message.channels) ? message.channels : [];
+        if (nextChannels.length > 0) {
+          setChannels(nextChannels);
+          const exists = nextChannels.some((channel: any) => channel?.id === selectedChannelId);
+          if (!exists) {
+            setSelectedChannelId('general');
+            wsClient.send({ type: 'channel_select', channelId: 'general' });
+          }
+          const selected = nextChannels.find((channel: any) => channel?.id === selectedChannelId);
+          setSelectedQueueLength(Number(selected?.queue_length || 0));
+        }
+        break;
+      }
+      case 'channel_deleted': {
+        const deletedChannelId = channelIdFromMessage(message);
+        if (deletedChannelId === selectedChannelId) {
+          setSelectedChannelId('general');
+          setQueuePosition(null);
+          wsClient.send({ type: 'channel_select', channelId: 'general' });
+        }
+        break;
+      }
+      case 'ptt_queued': {
+        const messageChannelId = channelIdFromMessage(message);
+        if (messageChannelId !== selectedChannelId) break;
+        const position = Number(message.position);
+        setQueuePosition(Number.isFinite(position) && position > 0 ? position : null);
+        setSelectedQueueLength(Number(message.queue_length || 0));
+        break;
+      }
+      case 'ptt_granted':
       case 'ptt_start': {
+        const messageChannelId = channelIdFromMessage(message);
+        if (messageChannelId !== selectedChannelId) break;
         const senderId = memberIdFromMessage(message);
         if (!senderId) return;
+
+        if (senderId === userId) {
+          setQueuePosition(null);
+          pendingPttRef.current = false;
+          setIsRequestingToken(false);
+          if (!talkIntentRef.current) {
+            wsClient.send({ type: 'ptt_release', channelId: messageChannelId });
+            break;
+          }
+
+          const manager = groupAudioRef.current;
+          if (manager) {
+            manager.setMicEnabled(true)
+              .then(() => {
+                setIsTransmitting(true);
+                setMembers((prev) => ({
+                  ...prev,
+                  [senderId]: {
+                    id: senderId,
+                    name: displayName || prev[senderId]?.name || 'You',
+                    isTalking: true,
+                  },
+                }));
+                setActiveSpeaker({ id: senderId, name: displayName || 'You', isTalking: true });
+              })
+              .catch(async (error) => {
+                await manager.setMicEnabled(false).catch(() => null);
+                wsClient.send({ type: 'ptt_release', channelId: messageChannelId });
+                const text = error instanceof Error ? error.message : String(error);
+                setPermissionError(text || 'Unable to access microphone');
+              });
+          }
+        }
+
         upsertMemberFromPresence(message, true);
         setActiveSpeaker({
           id: senderId,
@@ -288,7 +361,10 @@ const IntercomScreen = () => {
         });
         break;
       }
+      case 'ptt_released':
       case 'ptt_end': {
+        const messageChannelId = channelIdFromMessage(message);
+        if (messageChannelId !== selectedChannelId) break;
         const senderId = memberIdFromMessage(message);
         if (!senderId) return;
         setMembers((prev) => {
@@ -303,11 +379,50 @@ const IntercomScreen = () => {
         });
         setActiveSpeaker((current) => (current && current.id === senderId ? null : current));
         setChannelBusy(false);
+        if (senderId === userId) {
+          pendingPttRef.current = false;
+          talkIntentRef.current = false;
+          setIsTransmitting(false);
+          setIsRequestingToken(false);
+          groupAudioRef.current?.setMicEnabled(false).catch(() => null);
+        }
+        break;
+      }
+      case 'ptt_denied': {
+        const messageChannelId = channelIdFromMessage(message);
+        if (messageChannelId !== selectedChannelId) break;
+        pendingPttRef.current = false;
+        talkIntentRef.current = false;
+        setIsTransmitting(false);
+        setIsRequestingToken(false);
+        setQueuePosition(null);
+        setChannelBusy(message?.reason !== 'muted');
+        groupAudioRef.current?.setMicEnabled(false).catch(() => null);
+        if (message?.reason === 'muted') {
+          setPermissionError('You are muted in this channel by an admin');
+        }
+        if (message?.reason !== 'muted') {
+          setTimeout(() => setChannelBusy(false), 3000);
+        }
+        break;
+      }
+      case 'ptt_force_release': {
+        const messageChannelId = channelIdFromMessage(message);
+        if (messageChannelId !== selectedChannelId) break;
+        talkIntentRef.current = false;
+        pendingPttRef.current = false;
+        setIsTransmitting(false);
+        setIsRequestingToken(false);
+        setQueuePosition(null);
+        groupAudioRef.current?.setMicEnabled(false).catch(() => null);
         break;
       }
       case 'ptt_busy': {
         setChannelBusy(true);
         pendingPttRef.current = false;
+        talkIntentRef.current = false;
+        setIsRequestingToken(false);
+        setQueuePosition(null);
         groupAudioRef.current?.setMicEnabled(false).catch(() => null);
         setIsTransmitting(false);
         setActiveSpeaker(null);
@@ -329,7 +444,17 @@ const IntercomScreen = () => {
       default:
         break;
     }
-  }, [displayName, handleMemberSnapshot, handlePresence, handleWebRtcSignal, memberIdFromMessage, upsertMemberFromPresence, userId]);
+  }, [
+    channelIdFromMessage,
+    displayName,
+    handleMemberSnapshot,
+    handlePresence,
+    handleWebRtcSignal,
+    memberIdFromMessage,
+    selectedChannelId,
+    upsertMemberFromPresence,
+    userId,
+  ]);
 
   useEffect(() => {
     let mounted = true;
@@ -376,10 +501,23 @@ const IntercomScreen = () => {
   useEffect(() => {
     if (!userId || !groupId) return;
     wsClient.connect(userId, groupId, displayName);
+    setSelectedChannelId('general');
+    setQueuePosition(null);
     return () => {
       wsClient.disconnect();
     };
   }, [displayName, groupId, userId]);
+
+  useEffect(() => {
+    if (connectionStatus !== 'connected' || !groupId) return;
+    wsClient.send({ type: 'channels_list' });
+    wsClient.send({ type: 'channel_select', channelId: selectedChannelId });
+  }, [connectionStatus, groupId, selectedChannelId]);
+
+  useEffect(() => {
+    const selected = channels.find((channel) => channel.id === selectedChannelId);
+    setSelectedQueueLength(Number(selected?.queue_length || 0));
+  }, [channels, selectedChannelId]);
 
   useEffect(() => {
     if (!userId) return;
@@ -515,7 +653,7 @@ const IntercomScreen = () => {
     ? connectionStatus === 'connected'
       ? alwaysOnActive
         ? 'Always-on intercom active'
-        : 'Connected to group intercom'
+        : `Connected to #${selectedChannelId}`
       : 'Connecting to intercom...'
     : 'Join a group to enable intercom';
 
@@ -532,6 +670,36 @@ const IntercomScreen = () => {
       <ScrollView style={styles.scrollArea} contentContainerStyle={styles.scrollContent} bounces={false}>
         <View style={styles.infoBanner}>
           <Text style={styles.infoText}>📱 Voice works phone-to-phone · BLE iPod for testing only</Text>
+        </View>
+
+        <View style={styles.channelCard}>
+          <Text style={styles.heading}>Channels</Text>
+          <View style={styles.channelList}>
+            {channels.map((channel) => {
+              const isActive = channel.id === selectedChannelId;
+              const label = channel.name || channel.id;
+              const hasQueue = Number(channel.queue_length || 0) > 0;
+              return (
+                <Pressable
+                  key={channel.id}
+                  disabled={isTransmitting}
+                  onPress={() => {
+                    setSelectedChannelId(channel.id);
+                    setQueuePosition(null);
+                    wsClient.send({ type: 'channel_select', channelId: channel.id });
+                  }}
+                  style={[styles.channelChip, isActive && styles.channelChipActive, isTransmitting && styles.channelChipDisabled]}
+                >
+                  <Text style={[styles.channelChipText, isActive && styles.channelChipTextActive]}>{label}</Text>
+                  {hasQueue ? (
+                    <View style={[styles.queueBadge, isActive && styles.queueBadgeActive]}>
+                      <Text style={styles.queueBadgeText}>{Number(channel.queue_length || 0)}</Text>
+                    </View>
+                  ) : null}
+                </Pressable>
+              );
+            })}
+          </View>
         </View>
 
         <View style={styles.card}>
@@ -598,6 +766,11 @@ const IntercomScreen = () => {
             {groupAudioMode === 'fallback' ? ' (PTT fallback)' : ''}
           </Text>
         )}
+        {queuePosition ? (
+          <Text style={styles.queueStatus}>In queue for #{selectedChannelId}: position {queuePosition}</Text>
+        ) : selectedQueueLength > 0 ? (
+          <Text style={styles.queueStatus}>Queue waiting in #{selectedChannelId}: {selectedQueueLength}</Text>
+        ) : null}
         <Pressable
           onPressIn={startTalking}
           onPressOut={stopTalking}
@@ -609,7 +782,13 @@ const IntercomScreen = () => {
           ]}
         >
           <Text style={styles.pttLabel}>
-            {alwaysOnActive ? 'ALWAYS-ON ENABLED' : isTransmitting ? 'RELEASE TO SEND' : 'HOLD TO TALK'}
+            {alwaysOnActive
+              ? 'ALWAYS-ON ENABLED'
+              : isTransmitting
+                ? 'RELEASE TO SEND'
+                : isRequestingToken
+                  ? 'REQUESTING TOKEN...'
+                  : 'HOLD TO TALK'}
           </Text>
         </Pressable>
         {permissionError ? <Text style={styles.errorText}>{permissionError}</Text> : null}
@@ -647,6 +826,59 @@ const styles = StyleSheet.create({
     backgroundColor: '#10243b',
     borderRadius: 16,
     padding: 16,
+  },
+  channelCard: {
+    backgroundColor: '#10243b',
+    borderRadius: 16,
+    padding: 16,
+  },
+  channelList: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  channelChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    borderRadius: 999,
+    backgroundColor: '#0d2034',
+    borderWidth: 1,
+    borderColor: '#1e3a5f',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  channelChipActive: {
+    backgroundColor: '#1e88e5',
+    borderColor: '#64b5f6',
+  },
+  channelChipDisabled: {
+    opacity: 0.65,
+  },
+  channelChipText: {
+    color: '#9fb4cc',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  channelChipTextActive: {
+    color: '#ffffff',
+  },
+  queueBadge: {
+    minWidth: 18,
+    borderRadius: 9,
+    backgroundColor: '#26384f',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  queueBadgeActive: {
+    backgroundColor: '#0d2034',
+  },
+  queueBadgeText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '800',
   },
   heading: {
     color: '#fff',
@@ -764,6 +996,11 @@ const styles = StyleSheet.create({
   },
   status: {
     color: '#9fb4cc',
+  },
+  queueStatus: {
+    color: '#64ffda',
+    fontSize: 12,
+    fontWeight: '600',
   },
   busyText: {
     color: '#ff9800',
