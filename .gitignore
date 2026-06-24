@@ -9,3 +9,4 @@ build/
 pm2.log
 *.pid
 .next
+.cursorignore
