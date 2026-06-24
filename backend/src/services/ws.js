@@ -14,6 +14,7 @@ const {
   forceRotate,
   releaseUserFromAll,
 } = require('./channels');
+const { triggerSos, acknowledgeSos, resolveSos, FALLBACK_AFTER_MS, setSosBroadcaster } = require('./sos');
 
 // In-memory room registry: groupId → Set<ws>
 const rooms = new Map();
@@ -300,10 +301,15 @@ async function handleMessage(ws, msg) {
         ws.close(4001, 'unauthorized');
         return;
       }
+      if (!msg.admin_user_id || !UUID_RE.test(msg.admin_user_id)) {
+        ws.send(JSON.stringify({ type: 'error', message: 'admin_user_id required' }));
+        return;
+      }
       if (!rooms.has('admin')) rooms.set('admin', new Set());
       rooms.get('admin').add(ws);
       ws.adminRoom = true;
-      ws.send(JSON.stringify({ type: 'joined', room: 'admin' }));
+      ws.adminUserId = msg.admin_user_id;
+      ws.send(JSON.stringify({ type: 'joined', room: 'admin', admin_user_id: msg.admin_user_id }));
       break;
     }
 
@@ -920,6 +926,93 @@ async function handleMessage(ws, msg) {
       break;
     }
 
+    case 'sos_trigger': {
+      if (!ws.userId) {
+        ws.send(JSON.stringify({ type: 'sos_error', code: 'unauthorized', message: 'Join a group first' }));
+        return;
+      }
+
+      const groupId = msg.group_id || ws.groupId;
+      try {
+        const event = await triggerSos({
+          userId: ws.userId,
+          groupId,
+          lat: msg.lat,
+          lng: msg.lng,
+          timestamp: msg.client_timestamp,
+          source: 'ws',
+        });
+        ws.send(JSON.stringify({
+          type: 'sos_triggered',
+          sos_id: event.sos_id,
+          group_id: event.group_id,
+          triggered_at: event.triggered_at,
+          fallback_after_ms: FALLBACK_AFTER_MS,
+        }));
+      } catch (err) {
+        ws.send(JSON.stringify({
+          type: 'sos_error',
+          code: err.code || 'sos_trigger_failed',
+          message: err.message || 'Failed to trigger SOS',
+        }));
+      }
+      break;
+    }
+
+    case 'sos_acknowledge': {
+      if (!ws.adminRoom) {
+        ws.send(JSON.stringify({ type: 'sos_error', code: 'unauthorized', message: 'Admin room required' }));
+        return;
+      }
+
+      const adminUserId = msg.admin_user_id || ws.adminUserId;
+      try {
+        const event = await acknowledgeSos({
+          sosId: msg.sos_id,
+          adminUserId,
+        });
+        ws.send(JSON.stringify({
+          type: 'sos_acknowledge_ok',
+          sos_id: event.sos_id,
+          acknowledged_at: event.acknowledged_at,
+        }));
+      } catch (err) {
+        ws.send(JSON.stringify({
+          type: 'sos_error',
+          code: err.code || 'sos_acknowledge_failed',
+          message: err.message || 'Failed to acknowledge SOS',
+        }));
+      }
+      break;
+    }
+
+    case 'sos_resolve': {
+      if (!ws.adminRoom) {
+        ws.send(JSON.stringify({ type: 'sos_error', code: 'unauthorized', message: 'Admin room required' }));
+        return;
+      }
+
+      const adminUserId = msg.admin_user_id || ws.adminUserId;
+      try {
+        const event = await resolveSos({
+          sosId: msg.sos_id,
+          adminUserId,
+        });
+        ws.send(JSON.stringify({
+          type: 'sos_resolve_ok',
+          sos_id: event.sos_id,
+          resolved_at: event.resolved_at,
+        }));
+      } catch (err) {
+        ws.send(JSON.stringify({
+          type: 'sos_error',
+          code: err.code || 'sos_resolve_failed',
+          message: err.message || 'Failed to resolve SOS',
+        }));
+      }
+      break;
+    }
+
     case 'goggle_register': {
       if (!ws.userId) {
         ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' }));
@@ -1128,6 +1221,11 @@ function disconnectUser(userId, reason = 'admin_disconnect') {
   socket.close(4001, reason);
   userSockets.delete(userId);
 }
+
+setSosBroadcaster({
+  broadcastToGroup,
+  broadcastToRoom,
+});
 
 module.exports = {
   setupWebSocket,

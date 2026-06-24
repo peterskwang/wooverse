@@ -66,8 +66,11 @@ export const adminApi = {
   getUsers: () => adminFetch<AdminUser[]>('/api/admin/users'),
   getGroups: () => adminFetch<AdminGroup[]>('/api/admin/groups'),
   getSosEvents: () => adminFetch<AdminSosEvent[]>('/api/admin/sos'),
-  resolveSos: (id: string) =>
-    adminFetch<AdminSosEvent & { resolved_by_admin: boolean }>(`/api/admin/sos/${id}/resolve`, { method: 'PATCH' }),
+  resolveSos: (id: string, adminUserId?: string) =>
+    adminFetch<AdminSosEvent & { resolved_by_admin: boolean }>(`/api/admin/sos/${id}/resolve`, {
+      method: 'PATCH',
+      body: JSON.stringify({ admin_user_id: adminUserId }),
+    }),
   banUser: (id: string) =>
     adminFetch<{ ok: boolean; banned_at: string }>(`/api/admin/users/${id}/ban`, { method: 'POST' }),
   deleteGroup: (id: string) =>
