@@ -19,6 +19,7 @@ interface MemberState {
 }
 
 const STORAGE_KEYS = ['userId', 'groupId', 'displayName', 'intercomAlwaysOn'] as const;
+const RECENT_RECONNECT_BADGE_MS = 15_000;
 
 const IntercomScreen = () => {
   const [identity, setIdentity] = useState<Identity>({ userId: '', groupId: '', name: '' });
@@ -41,6 +42,7 @@ const IntercomScreen = () => {
   const groupAudioRef = useRef<GroupAudioManager | null>(null);
   const pendingPttRef = useRef(false);
   const recoveryOfferTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const reconnectBadgeUntilRef = useRef(0);
   const pulseScale = useRef(new Animated.Value(1)).current;
 
   const { userId, groupId, name: displayName } = identity;
@@ -420,7 +422,19 @@ const IntercomScreen = () => {
 
   useEffect(() => {
     const unsubscribe = wsClient.onSignalQuality((quality) => {
-      setSignalQuality(quality);
+      const now = Date.now();
+      setSignalQuality((prev) => {
+        let reconnectCount = quality.reconnectCount;
+        if (quality.reconnectCount > 0) {
+          reconnectBadgeUntilRef.current = now + RECENT_RECONNECT_BADGE_MS;
+        } else if (prev.reconnectCount > 0 && now < reconnectBadgeUntilRef.current) {
+          reconnectCount = prev.reconnectCount;
+        } else {
+          reconnectBadgeUntilRef.current = 0;
+        }
+
+        return { ...quality, reconnectCount };
+      });
       groupAudioRef.current?.setSignalTier(quality.tier).catch((error) => {
         console.warn('[intercom] setSignalTier failed:', error);
       });
@@ -437,7 +451,7 @@ const IntercomScreen = () => {
     const manager = groupAudioRef.current;
     if (!manager) return;
 
-    const nextMode: GroupAudioMode = intercomAlwaysOn && !fallbackReason ? 'always_on' : 'ptt';
+    const nextMode: GroupAudioMode = intercomAlwaysOn ? 'always_on' : 'ptt';
     manager.setMode(nextMode).catch((error) => {
       console.warn('[intercom] setMode failed:', error);
     });
@@ -456,7 +470,7 @@ const IntercomScreen = () => {
         return;
       }
 
-      if (manager.getMode() === 'always_on') {
+      if (manager.getMode() === 'always_on' && !fallbackReason) {
         manager.setMicEnabled(true).catch(() => null);
       }
     };
@@ -465,7 +479,7 @@ const IntercomScreen = () => {
     return () => {
       subscription.remove();
     };
-  }, [isTransmitting, stopTalking]);
+  }, [fallbackReason, isTransmitting, stopTalking]);
 
   useEffect(() => {
     let animation: Animated.CompositeAnimation | null = null;
