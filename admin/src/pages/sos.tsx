@@ -9,28 +9,54 @@ const TileLayer = dynamic(() => import('react-leaflet').then((mod) => mod.TileLa
 const Marker = dynamic(() => import('react-leaflet').then((mod) => mod.Marker), { ssr: false });
 const Popup = dynamic(() => import('react-leaflet').then((mod) => mod.Popup), { ssr: false });
 
+type WsStatus = 'connecting' | 'connected' | 'disconnected';
+
+type SosEvent = AdminSosEvent & {
+  acknowledged_at?: string | null;
+  acknowledged_by?: string | null;
+  sms_fallback_status?: string | null;
+  sms_fallback_sent_at?: string | null;
+};
+
 function getWsUrl() {
   return getBackendUrl().replace(/^http/, 'ws') + '/ws';
 }
 
-function hasCoordinates(event: AdminSosEvent) {
+function hasCoordinates(event: SosEvent) {
   return event.lat != null && event.lng != null && Number.isFinite(Number(event.lat)) && Number.isFinite(Number(event.lng));
 }
 
+function getEventStatus(event: SosEvent) {
+  if (event.resolved_at) return 'resolved';
+  if (event.acknowledged_at) return 'acknowledged';
+  return 'active';
+}
+
+function formatElapsed(triggeredAt: string) {
+  const elapsedMs = Date.now() - new Date(triggeredAt).getTime();
+  const elapsedSec = Math.max(0, Math.floor(elapsedMs / 1000));
+  const minutes = Math.floor(elapsedSec / 60);
+  const seconds = elapsedSec % 60;
+  return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+}
+
 export default function SosPage() {
-  const [events, setEvents] = useState<AdminSosEvent[]>([]);
+  const [events, setEvents] = useState<SosEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const [wsStatus, setWsStatus] = useState<WsStatus>('connecting');
   const [resolvingId, setResolvingId] = useState<string | null>(null);
+  const [acknowledgingId, setAcknowledgingId] = useState<string | null>(null);
+  const [adminUserId, setAdminUserId] = useState('');
   const reconnectTimer = useRef<number | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
 
   const loadEvents = useCallback(async (showLoading = true) => {
     try {
       if (showLoading) setLoading(true);
       setError('');
       const data = await adminApi.getSosEvents();
-      setEvents(data);
+      setEvents(data as SosEvent[]);
     } catch (e: any) {
       setError(e.message || 'Failed to load SOS events');
     } finally {
@@ -39,33 +65,51 @@ export default function SosPage() {
   }, []);
 
   useEffect(() => {
+    setAdminUserId(sessionStorage.getItem('admin_user_id') || '');
     loadEvents();
   }, [loadEvents]);
 
   useEffect(() => {
-    let ws: WebSocket | null = null;
     let closedByEffect = false;
     let reconnectDelay = 1000;
 
     const connect = () => {
       if (closedByEffect) return;
       setWsStatus('connecting');
-      ws = new WebSocket(getWsUrl());
+      const ws = new WebSocket(getWsUrl());
+      wsRef.current = ws;
 
       ws.onopen = () => {
         reconnectDelay = 1000;
         setWsStatus('connected');
-        ws?.send(JSON.stringify({ type: 'admin_join', adminPassword: getAdminPassword() }));
+        ws.send(JSON.stringify({
+          type: 'admin_join',
+          adminPassword: getAdminPassword(),
+          admin_user_id: sessionStorage.getItem('admin_user_id') || '',
+        }));
       };
 
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
-          if (msg.type === 'sos_alert' || msg.type === 'sos_resolved' || msg.type === 'refresh_sos') {
+          if (
+            msg.type === 'sos_alert' ||
+            msg.type === 'sos_acknowledged' ||
+            msg.type === 'sos_resolved' ||
+            msg.type === 'sos_sms_fallback_sent' ||
+            msg.type === 'sos_sms_fallback_skipped' ||
+            msg.type === 'refresh_sos'
+          ) {
             loadEvents(false);
+            setAcknowledgingId(null);
+            setResolvingId(null);
+          } else if (msg.type === 'sos_error') {
+            setError(msg.message || 'SOS operation failed');
+            setAcknowledgingId(null);
+            setResolvingId(null);
           }
         } catch {
-          // Ignore malformed WS payloads; REST refresh remains the source of truth.
+          // Keep REST refresh as fallback source of truth.
         }
       };
 
@@ -78,7 +122,7 @@ export default function SosPage() {
       };
 
       ws.onerror = () => {
-        ws?.close();
+        ws.close();
       };
     };
 
@@ -87,23 +131,28 @@ export default function SosPage() {
     return () => {
       closedByEffect = true;
       if (reconnectTimer.current) window.clearTimeout(reconnectTimer.current);
-      ws?.close();
+      wsRef.current?.close();
+      wsRef.current = null;
     };
   }, [loadEvents]);
 
   useEffect(() => {
     if (wsStatus === 'connected') return undefined;
-
     const pollTimer = window.setInterval(() => {
       loadEvents(false);
     }, 30000);
-
     return () => window.clearInterval(pollTimer);
   }, [loadEvents, wsStatus]);
 
-  const activeEvents = events.filter((e) => !e.resolved_at);
+  const activeEvents = useMemo(
+    () => events.filter((event) => !event.resolved_at).sort((a, b) => +new Date(a.triggered_at) - +new Date(b.triggered_at)),
+    [events]
+  );
+  const historyEvents = useMemo(
+    () => [...events].sort((a, b) => +new Date(b.triggered_at) - +new Date(a.triggered_at)),
+    [events]
+  );
   const activeMapEvents = activeEvents.filter(hasCoordinates);
-  const activeCount = activeEvents.length;
   const mapCenter = useMemo<[number, number]>(() => {
     if (activeMapEvents.length > 0) {
       return [Number(activeMapEvents[0].lat), Number(activeMapEvents[0].lng)];
@@ -121,10 +170,36 @@ export default function SosPage() {
     });
   }, []);
 
+  const acknowledgeEvent = async (id: string) => {
+    if (!adminUserId) {
+      setError('Admin user ID is required for acknowledge');
+      return;
+    }
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setError('WebSocket disconnected, acknowledge requires live admin connection');
+      return;
+    }
+    setAcknowledgingId(id);
+    setError('');
+    wsRef.current.send(JSON.stringify({
+      type: 'sos_acknowledge',
+      sos_id: id,
+      admin_user_id: adminUserId,
+    }));
+  };
+
   const resolveEvent = async (id: string) => {
+    setResolvingId(id);
+    setError('');
     try {
-      setResolvingId(id);
-      setError('');
+      if (adminUserId && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
+          type: 'sos_resolve',
+          sos_id: id,
+          admin_user_id: adminUserId,
+        }));
+        return;
+      }
       await adminApi.resolveSos(id);
       await loadEvents(false);
     } catch (e: any) {
@@ -134,26 +209,32 @@ export default function SosPage() {
     }
   };
 
+  const saveAdminUserId = (value: string) => {
+    const trimmed = value.trim();
+    setAdminUserId(trimmed);
+    sessionStorage.setItem('admin_user_id', trimmed);
+  };
+
   return (
     <Layout>
-      <div className="flex items-center justify-between mb-6">
+      <div className="mb-6 flex items-center justify-between gap-3">
         <h2 className="text-2xl font-bold text-white">
-          SOS Events{' '}
-          <span className="text-slate-400 text-lg font-normal">({events.length})</span>
-          {activeCount > 0 && (
-            <span className="ml-3 bg-red-900/60 text-red-400 text-sm font-bold px-3 py-1 rounded-full animate-pulse">
-              {activeCount} ACTIVE
+          SOS Triage <span className="text-slate-400 text-lg font-normal">({events.length})</span>
+          {activeEvents.length > 0 && (
+            <span className="ml-3 rounded-full bg-red-900/60 px-3 py-1 text-sm font-bold text-red-400 animate-pulse">
+              {activeEvents.length} ACTIVE
             </span>
           )}
         </h2>
         <button
           onClick={() => loadEvents()}
-          className="text-sm bg-[#1e3a5f] hover:bg-[#1e88e5] text-white px-4 py-2 rounded-lg transition-colors"
+          className="rounded-lg bg-[#1e3a5f] px-4 py-2 text-sm text-white transition-colors hover:bg-[#1e88e5]"
         >
           Refresh
         </button>
       </div>
-      <div className="mb-4 flex items-center gap-3 text-xs">
+
+      <div className="mb-4 flex flex-wrap items-center gap-3 text-xs">
         <span
           className={`inline-flex h-2 w-2 rounded-full ${
             wsStatus === 'connected' ? 'bg-green-400' : wsStatus === 'connecting' ? 'bg-yellow-400' : 'bg-red-400'
@@ -164,8 +245,20 @@ export default function SosPage() {
           {wsStatus !== 'connected' && ' - polling every 30s'}
         </span>
       </div>
+
+      <div className="mb-6 rounded-xl border border-[#1e3a5f] bg-[#06121f] p-4">
+        <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-slate-400">Admin User ID</label>
+        <input
+          value={adminUserId}
+          onChange={(event) => saveAdminUserId(event.target.value)}
+          placeholder="UUID for acknowledge/resolve attribution"
+          className="w-full rounded-md border border-[#1e3a5f] bg-[#081a2c] px-3 py-2 text-sm text-white focus:border-[#1e88e5] focus:outline-none"
+        />
+      </div>
+
       {loading && <p className="text-slate-400">Loading...</p>}
-      {error && <p className="text-red-400">{error}</p>}
+      {error && <p className="mb-4 text-red-400">{error}</p>}
+
       {!loading && !error && (
         <div className="space-y-6">
           <div className="h-[360px] overflow-hidden rounded-xl border border-[#1e3a5f] bg-[#06121f]">
@@ -175,86 +268,137 @@ export default function SosPage() {
               zoom={activeMapEvents.length > 0 ? 13 : 5}
               className="h-full w-full"
             >
-              <TileLayer
-                attribution="&copy; OpenStreetMap contributors"
-                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              />
+              <TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
               {activeMapEvents.map((event) => (
-                <Marker
-                  key={event.id}
-                  position={[Number(event.lat), Number(event.lng)]}
-                  icon={sosIcon}
-                >
+                <Marker key={event.id} position={[Number(event.lat), Number(event.lng)]} icon={sosIcon}>
                   <Popup>
-                    <div className="space-y-2">
+                    <div className="space-y-1">
                       <p className="font-semibold">{event.user_name}</p>
-                      <p>{new Date(event.triggered_at).toLocaleString()}</p>
-                      <button
-                        onClick={() => resolveEvent(event.id)}
-                        disabled={resolvingId === event.id}
-                        className="rounded bg-red-600 px-3 py-1 text-xs font-semibold text-white disabled:opacity-60"
-                      >
-                        {resolvingId === event.id ? 'Resolving...' : 'Resolve'}
-                      </button>
+                      <p className="text-xs">{new Date(event.triggered_at).toLocaleString()}</p>
+                      <p className="text-xs">Status: {getEventStatus(event)}</p>
                     </div>
                   </Popup>
                 </Marker>
               ))}
             </MapContainer>
           </div>
+
+          <div className="rounded-xl border border-[#1e3a5f]">
+            <div className="border-b border-[#1e3a5f] bg-[#0d2034] px-4 py-3 text-sm font-semibold text-white">
+              Active Queue
+            </div>
+            {activeEvents.length === 0 ? (
+              <p className="px-4 py-8 text-center text-slate-400">No active SOS alerts.</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-[#0a1a2b]">
+                    <tr>
+                      <th className="px-4 py-3 text-left font-semibold text-slate-400">User</th>
+                      <th className="px-4 py-3 text-left font-semibold text-slate-400">Triggered</th>
+                      <th className="px-4 py-3 text-left font-semibold text-slate-400">Elapsed</th>
+                      <th className="px-4 py-3 text-left font-semibold text-slate-400">GPS</th>
+                      <th className="px-4 py-3 text-left font-semibold text-slate-400">Ack</th>
+                      <th className="px-4 py-3 text-left font-semibold text-slate-400">Fallback</th>
+                      <th className="px-4 py-3 text-right font-semibold text-slate-400">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {activeEvents.map((event, index) => (
+                      <tr key={event.id} className={`border-t border-[#1e3a5f] ${index % 2 === 0 ? 'bg-[#06121f]' : 'bg-[#081a2c]'}`}>
+                        <td className="px-4 py-3 font-semibold text-white">{event.user_name}</td>
+                        <td className="px-4 py-3 text-slate-300">{new Date(event.triggered_at).toLocaleString()}</td>
+                        <td className="px-4 py-3 font-mono text-red-300">{formatElapsed(event.triggered_at)}</td>
+                        <td className="px-4 py-3 text-xs">
+                          {hasCoordinates(event) ? (
+                            <a
+                              href={`https://uri.amap.com/marker?position=${Number(event.lng)},${Number(event.lat)}&name=SOS`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-[#64ffda] underline"
+                            >
+                              {Number(event.lat).toFixed(5)}, {Number(event.lng).toFixed(5)}
+                            </a>
+                          ) : (
+                            <span className="text-slate-500">No location</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs">
+                          {event.acknowledged_at ? (
+                            <span className="text-amber-300">
+                              {new Date(event.acknowledged_at).toLocaleTimeString()}
+                              {event.acknowledged_by ? ` by ${event.acknowledged_by}` : ''}
+                            </span>
+                          ) : (
+                            <span className="text-slate-500">Pending</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-slate-300">{event.sms_fallback_status || 'pending'}</td>
+                        <td className="px-4 py-3 text-right">
+                          <div className="flex justify-end gap-2">
+                            <button
+                              onClick={() => acknowledgeEvent(event.id)}
+                              disabled={Boolean(event.acknowledged_at || event.resolved_at) || acknowledgingId === event.id}
+                              className="rounded-lg bg-amber-700 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-amber-600 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+                            >
+                              {acknowledgingId === event.id ? 'Acknowledging...' : event.acknowledged_at ? 'Acknowledged' : 'Acknowledge'}
+                            </button>
+                            <button
+                              onClick={() => resolveEvent(event.id)}
+                              disabled={Boolean(event.resolved_at) || resolvingId === event.id}
+                              className="rounded-lg bg-red-700 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+                            >
+                              {resolvingId === event.id ? 'Resolving...' : 'Resolve'}
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
           <div className="overflow-x-auto rounded-xl border border-[#1e3a5f]">
+            <div className="border-b border-[#1e3a5f] bg-[#0d2034] px-4 py-3 text-sm font-semibold text-white">
+              Alert History
+            </div>
             <table className="w-full text-sm">
-              <thead className="bg-[#0d2034]">
+              <thead className="bg-[#0a1a2b]">
                 <tr>
-                  <th className="px-4 py-3 text-left text-slate-400 font-semibold">User</th>
-                  <th className="px-4 py-3 text-left text-slate-400 font-semibold">Coordinates</th>
-                  <th className="px-4 py-3 text-left text-slate-400 font-semibold">Triggered</th>
-                  <th className="px-4 py-3 text-left text-slate-400 font-semibold">Status</th>
-                  <th className="px-4 py-3 text-right text-slate-400 font-semibold">Action</th>
+                  <th className="px-4 py-3 text-left font-semibold text-slate-400">User</th>
+                  <th className="px-4 py-3 text-left font-semibold text-slate-400">Triggered</th>
+                  <th className="px-4 py-3 text-left font-semibold text-slate-400">Status</th>
+                  <th className="px-4 py-3 text-left font-semibold text-slate-400">Resolved</th>
                 </tr>
               </thead>
               <tbody>
-                {events.map((event, i) => (
-                  <tr
-                    key={event.id}
-                    className={`border-t border-[#1e3a5f] ${i % 2 === 0 ? 'bg-[#06121f]' : 'bg-[#081a2c]'}`}
-                  >
-                    <td className="px-4 py-3 text-white font-semibold">{event.user_name}</td>
-                    <td className="px-4 py-3 font-mono text-[#64ffda] text-xs">
-                      {hasCoordinates(event)
-                        ? `${Number(event.lat).toFixed(5)}, ${Number(event.lng).toFixed(5)}`
-                        : '—'}
-                    </td>
-                    <td className="px-4 py-3 text-slate-400">
-                      {new Date(event.triggered_at).toLocaleString()}
-                    </td>
+                {historyEvents.map((event, index) => (
+                  <tr key={event.id} className={`border-t border-[#1e3a5f] ${index % 2 === 0 ? 'bg-[#06121f]' : 'bg-[#081a2c]'}`}>
+                    <td className="px-4 py-3 font-semibold text-white">{event.user_name}</td>
+                    <td className="px-4 py-3 text-slate-300">{new Date(event.triggered_at).toLocaleString()}</td>
                     <td className="px-4 py-3">
-                      {event.resolved_at ? (
-                        <span className="bg-green-900/40 text-green-400 px-2 py-1 rounded text-xs font-semibold">
-                          Resolved {new Date(event.resolved_at).toLocaleDateString()}
-                        </span>
-                      ) : (
-                        <span className="bg-red-900/50 text-red-400 px-2 py-1 rounded text-xs font-semibold animate-pulse">
-                          ACTIVE
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <button
-                        onClick={() => resolveEvent(event.id)}
-                        disabled={Boolean(event.resolved_at) || resolvingId === event.id}
-                        className="rounded-lg bg-red-700 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+                      <span
+                        className={`rounded px-2 py-1 text-xs font-semibold ${
+                          getEventStatus(event) === 'resolved'
+                            ? 'bg-green-900/40 text-green-400'
+                            : getEventStatus(event) === 'acknowledged'
+                              ? 'bg-amber-900/40 text-amber-300'
+                              : 'bg-red-900/50 text-red-400'
+                        }`}
                       >
-                        {resolvingId === event.id ? 'Resolving...' : event.resolved_at ? 'Resolved' : 'Resolve'}
-                      </button>
+                        {getEventStatus(event)}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-slate-300">
+                      {event.resolved_at ? new Date(event.resolved_at).toLocaleString() : '—'}
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-            {events.length === 0 && (
-              <p className="text-slate-400 text-center py-8">No SOS events recorded.</p>
-            )}
+            {historyEvents.length === 0 && <p className="py-8 text-center text-slate-400">No SOS events recorded.</p>}
           </div>
         </div>
       )}

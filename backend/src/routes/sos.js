@@ -1,9 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/auth');
-const { pool } = require('../config/db');
-const { broadcastToGroup, broadcastToRoom } = require('../services/ws');
-const { sendSosPush } = require('../services/push_notifications');
+const { triggerSos, resolveSos } = require('../services/sos');
 
 // Trigger SOS
 // POST /api/sos
@@ -13,47 +11,22 @@ router.post('/', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'group_id, lat, lng required' });
   }
   try {
-    const insert = await pool.query(
-      `INSERT INTO sos_events (user_id, group_id, lat, lng)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [req.user.userId, group_id, lat, lng]
-    );
-    const sosEvent = insert.rows[0];
-
-    const userResult = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.userId]);
-    const username = userResult.rows[0]?.name || 'Unknown';
-
-    broadcastToGroup(group_id, {
-      type: 'sos_alert',
-      user_id: req.user.userId,
-      username,
-      group_id,
+    const sosEvent = await triggerSos({
+      userId: req.user.userId,
+      groupId: group_id,
       lat,
       lng,
-      triggered_at: sosEvent.triggered_at,
-      sos_id: sosEvent.id,
+      timestamp: req.body.client_timestamp,
+      source: 'rest',
     });
-    broadcastToRoom('admin', {
-      type: 'sos_alert',
-      sos_id: sosEvent.id,
-      user_id: req.user.userId,
-      username,
-      group_id,
-      lat,
-      lng,
-      triggered_at: sosEvent.triggered_at,
-    });
-    broadcastToRoom('admin', { type: 'refresh_sos' });
-
-    const memberResult = await pool.query(
-      'SELECT user_id FROM group_members WHERE group_id = $1 AND user_id <> $2',
-      [group_id, req.user.userId]
-    );
-    const targetIds = memberResult.rows.map((row) => row.user_id);
-    sendSosPush(targetIds, { id: req.user.userId, name: username }, { lat, lng, group_id });
-
-    res.status(201).json({ ...sosEvent, username });
+    res.status(201).json(sosEvent);
   } catch (e) {
+    if (e.code === 'invalid_location' || e.code === 'missing_group_id') {
+      return res.status(400).json({ error: e.message });
+    }
+    if (e.code === 'not_group_member') {
+      return res.status(403).json({ error: e.message });
+    }
     console.error('[sos] create error:', e.message);
     res.status(500).json({ error: 'Server error' });
   }
@@ -63,24 +36,18 @@ router.post('/', requireAuth, async (req, res) => {
 // PATCH /api/sos/:id/resolve
 router.patch('/:id/resolve', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(
-      'UPDATE sos_events SET resolved_at = now(), resolved_by = $1 WHERE id = $2 RETURNING *',
-      [req.user.userId, req.params.id]
-    );
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'SOS event not found' });
-    }
-    const event = result.rows[0];
-    if (event.group_id) {
-      broadcastToGroup(event.group_id, {
-        type: 'sos_resolved',
-        sos_id: event.id,
-        resolved_by: req.user.userId,
-        resolved_at: event.resolved_at,
-      });
-    }
+    const event = await resolveSos({
+      sosId: req.params.id,
+      adminUserId: req.user.userId,
+    });
     res.json(event);
   } catch (e) {
+    if (e.code === 'not_found') {
+      return res.status(404).json({ error: 'SOS event not found' });
+    }
+    if (e.code === 'missing_sos_id' || e.code === 'missing_admin_user_id') {
+      return res.status(400).json({ error: e.message });
+    }
     console.error('[sos] resolve error:', e.message);
     res.status(500).json({ error: 'Server error' });
   }
