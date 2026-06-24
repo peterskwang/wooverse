@@ -1,7 +1,5 @@
 const { WebSocketServer } = require('ws');
 const { pool } = require('../config/db');
-const { WebSocketServer } = require('ws');
-const { pool } = require('../config/db');
 const {
   DEFAULT_CHANNEL_ID,
   listChannels,
