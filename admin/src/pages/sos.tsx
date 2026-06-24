@@ -70,28 +70,48 @@ export default function SosPage() {
   }, [loadEvents]);
 
   useEffect(() => {
+    const storedId = sessionStorage.getItem('admin_user_id');
+    if (!storedId) {
+      setWsStatus('disconnected');
+      wsRef.current?.close();
+      wsRef.current = null;
+      return;
+    }
+
     let closedByEffect = false;
     let reconnectDelay = 1000;
 
     const connect = () => {
       if (closedByEffect) return;
+      const currentId = sessionStorage.getItem('admin_user_id');
+      if (!currentId) return;
+
       setWsStatus('connecting');
       const ws = new WebSocket(getWsUrl());
       wsRef.current = ws;
 
       ws.onopen = () => {
         reconnectDelay = 1000;
-        setWsStatus('connected');
         ws.send(JSON.stringify({
           type: 'admin_join',
           adminPassword: getAdminPassword(),
-          admin_user_id: sessionStorage.getItem('admin_user_id') || '',
+          admin_user_id: currentId,
         }));
       };
 
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
+          if (msg.type === 'joined' && msg.room === 'admin') {
+            setWsStatus('connected');
+            return;
+          }
+          if (msg.type === 'error') {
+            setWsStatus('disconnected');
+            setError(`WS auth failed: ${msg.message || 'check admin password and user ID'}`);
+            ws.close();
+            return;
+          }
           if (
             msg.type === 'sos_alert' ||
             msg.type === 'sos_acknowledged' ||
@@ -134,7 +154,7 @@ export default function SosPage() {
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [loadEvents]);
+  }, [loadEvents, adminUserId]);
 
   useEffect(() => {
     if (wsStatus === 'connected') return undefined;
@@ -200,7 +220,8 @@ export default function SosPage() {
         }));
         return;
       }
-      await adminApi.resolveSos(id);
+      // REST fallback: use the Phase 4 service path with admin identity
+      await adminApi.resolveSos(id, adminUserId);
       await loadEvents(false);
     } catch (e: any) {
       setError(e.message || 'Failed to resolve SOS event');
@@ -211,8 +232,12 @@ export default function SosPage() {
 
   const saveAdminUserId = (value: string) => {
     const trimmed = value.trim();
+    const prevId = sessionStorage.getItem('admin_user_id');
     setAdminUserId(trimmed);
     sessionStorage.setItem('admin_user_id', trimmed);
+    if (prevId !== trimmed && wsRef.current) {
+      wsRef.current.close();
+    }
   };
 
   return (
