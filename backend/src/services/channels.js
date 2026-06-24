@@ -273,6 +273,19 @@ function muteUser(groupId, channelId, userId, onTimeout) {
   };
 }
 
+function unmuteUser(groupId, channelId, userId) {
+  const channel = getChannelState(groupId, channelId);
+  if (!channel) {
+    return { unmuted: false, reason: 'channel_not_found', channel_id: channelId };
+  }
+  channel.mutedUsers.delete(userId);
+  return {
+    unmuted: true,
+    channel_id: channelId,
+    user_id: userId,
+  };
+}
+
 function forceRotate(groupId, channelId, onTimeout) {
   const channel = getChannelState(groupId, channelId);
   if (!channel?.tokenHolder) {
@@ -324,6 +337,7 @@ module.exports = {
   createChannel,
   deleteChannel,
   muteUser,
+  unmuteUser,
   forceRotate,
   releaseUserFromAll,
 };
