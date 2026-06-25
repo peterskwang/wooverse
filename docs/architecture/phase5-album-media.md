@@ -79,6 +79,21 @@ enum MediaStatus {
 }
 ```
 
+### Existing Enum Migration
+
+`EvidenceType` currently lacks `PHOTO`. Add it before Phase 5 migrations:
+
+```prisma
+enum EvidenceType {
+  VIDEO
+  GPS_TRACK
+  AUDIO
+  PHOTO   // added for Phase 5 emergency photo evidence
+}
+```
+
+Migration SQL: `ALTER TYPE "EvidenceType" ADD VALUE 'PHOTO';`
+
 ### `albums`
 
 ```prisma
@@ -105,6 +120,24 @@ model Album {
   @@index([sosEventId])
   @@map("albums")
 }
+```
+
+Reverse relations to add to existing models:
+
+```prisma
+// User model — add:
+albums     Album[]
+mediaItems MediaItem[]
+
+// Device model — add:
+mediaItems MediaItem[]
+
+// SosEvent model — add:
+emergencyAlbum Album?     @relation("EmergencyAlbum")
+mediaItems     MediaItem[]
+
+// Evidence model — add:
+mediaItems MediaItem[]
 ```
 
 Rules:
@@ -153,6 +186,10 @@ model MediaItem {
   @@index([ownerUserId, createdAt])
   @@index([sosEventId])
   @@index([deviceId, capturedAt])
+  @@index([evidenceId])
+  @@map("media_items")
+}
+```
   @@map("media_items")
 }
 ```
@@ -410,6 +447,8 @@ Response `200`:
 Reject deletion with `409` when `locked=true`, the item is linked to active SOS/work order evidence, or retention has not expired.
 
 ## Wi-Fi Direct Flow
+
+> ⚠️ **Platform limitation**: Android supports generic Wi-Fi Direct peer-to-peer connections; iOS does not. On iOS, the goggle must present as a Wi-Fi access point (AP mode) or use Apple's Multipeer Connectivity framework (limited to Apple devices). The goggle firmware must support AP-mode media serving for cross-platform compatibility. This is a firmware requirement, not a mobile-app-only fix.
 
 Mobile is the coordinator. The backend never connects directly to goggles over Wi-Fi Direct.
 
@@ -693,6 +732,6 @@ Manual smoke:
 - Wi-Fi Direct behavior differs between iOS and Android and may need native package or permission changes. That is a separate approval-gated implementation decision.
 - Backend cannot guarantee emergency capture if the mobile app/goggle bridge is disconnected. SOS must remain successful without media.
 - OSS object lifecycle and evidence retention must be coordinated carefully so user media cleanup cannot delete active rescue evidence.
-- `EvidenceType` currently lacks `PHOTO`. Either add `PHOTO` with an approved migration or map still photos to a new media-only evidence relationship without pretending they are `VIDEO`.
+- `EvidenceType` currently lacks `PHOTO`. Resolution: add `PHOTO` to the EvidenceType enum with migration `ALTER TYPE "EvidenceType" ADD VALUE 'PHOTO'`, ran before PR A migrations. Emergency photos promoted to evidence will use `type=PHOTO`.
 - Prisma cannot express every useful partial index. The migration may need raw SQL for unique emergency album per SOS event and retention indexes.
 - Admin auth remains password-header based in parts of the app. Audit media admin actions before exposing cross-user previews.
