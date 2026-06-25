@@ -8,10 +8,28 @@ const { resolveSos } = require('../services/sos');
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // Simple password auth for admin
+// FINGERPRINT: 20260625-1800-auth-gate-test
+router.get('/fingerprint', (req, res) => {
+  const pass = req.headers['x-admin-password'];
+  if (!pass) return res.json({ msg: 'NO_AUTH_HEADER', env_set: !!process.env.ADMIN_PASSWORD, pass_val: 'undefined' });
+  if (pass !== process.env.ADMIN_PASSWORD) return res.json({ msg: 'WRONG_PASSWORD', env_set: !!process.env.ADMIN_PASSWORD, pass_val: pass });
+  return res.json({ msg: 'AUTH_OK', env_set: !!process.env.ADMIN_PASSWORD });
+});
+
+// Also instrument requireAdmin
 function requireAdmin(req, res, next) {
   const pass = req.headers['x-admin-password'];
   if (!pass || pass !== process.env.ADMIN_PASSWORD) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    // Return JSON that tells us what happened
+    return res.status(401).json({ 
+      error: 'Unauthorized',
+      debug: {
+        pass_present: !!pass,
+        env_set: !!process.env.ADMIN_PASSWORD,
+        pass_val: pass || 'undefined',
+        env_val: process.env.ADMIN_PASSWORD ? '***SET***' : 'undefined'
+      }
+    });
   }
   next();
 }
