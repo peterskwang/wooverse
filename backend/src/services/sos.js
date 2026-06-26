@@ -324,7 +324,9 @@ async function acknowledgeSos({ sosId, adminUserId }) {
 
 async function resolveSos({ sosId, adminUserId }) {
   validateUuid(sosId, 'sos_id');
-  validateUuid(adminUserId, 'admin_user_id');
+  // adminUserId is an admin identifier (e.g. 'admin'), not a user UUID.
+  // Per Phase 4 convention, resolved_by can be null or any identifier.
+  const resolvedBy = adminUserId || null;
 
   const result = await pool.query(
     `UPDATE sos_events
@@ -332,7 +334,7 @@ async function resolveSos({ sosId, adminUserId }) {
          resolved_by = COALESCE(resolved_by, $2)
      WHERE id = $1
      RETURNING *`,
-    [sosId, adminUserId]
+    [sosId, resolvedBy]
   );
   if (result.rowCount === 0) {
     const err = new Error('SOS event not found');
