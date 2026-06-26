@@ -52,8 +52,8 @@ jobs:
           tar \
             --exclude=.git \
             --exclude=node_modules \
-            --exclude=backend/node_modules \
-            --exclude=admin/node_modules \
+            --exclude='*/node_modules' \
+            --exclude='__tests__' \
             -czf wooverse-release.tgz .
 
       - name: Install Aliyun CLI
