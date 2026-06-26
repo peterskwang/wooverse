@@ -1,4 +1,5 @@
-const PRODUCTION_API_URL = 'https://api.wooverse.cn';
+// wooverse.cn blocked by Ali Cloud ICP compliance - using direct IP until ICP resolved
+const PRODUCTION_API_URL = 'http://47.101.222.190:8102';
 const DEVELOPMENT_API_URL = 'http://localhost:8100';
 
 export const EXPO_PUBLIC_API_URL =
